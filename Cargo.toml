@@ -1,0 +1,8 @@
+[package]
+name = "catio"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ruihang Xia <waynestxia@gmail.com>"]
+license = "MIT or Apache-2.0"
+
+[dependencies]
