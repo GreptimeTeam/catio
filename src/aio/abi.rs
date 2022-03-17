@@ -3,6 +3,8 @@ use std::os::unix::prelude::RawFd;
 
 pub(super) type IoContext = c_ulong;
 
+/// IO control block of Linux AIO.
+///
 /// From `linux/include/uabi/linux/aio_abi.h` and
 /// https://github.com/torvalds/linux/blob/4f12b742eb2b3a850ac8be7dc4ed52976fc6cb0b/include/uapi/linux/aio_abi.h#L73-L107
 #[repr(C)]
@@ -15,9 +17,10 @@ pub(super) struct Iocb {
     pub aio_reserved1: u32,
 
     // common fields
-    /// see IOCB_CMD_
+    /// see [IocbCmd] (IOCB_CMD_*)
     pub aio_lio_opcode: u16,
     pub aio_reqprio: u16,
+    /// file descriptor
     pub aio_fildes: u32,
 
     pub aio_buf: u64,
