@@ -7,19 +7,19 @@ use crate::error::{CatioError, Result};
 use libc::{c_int, c_long};
 use nix::errno;
 
-fn wrap_syscall(result: c_int) -> Result<()> {
+fn wrap_syscall(result: c_int) -> Result<i32> {
     if result >= 0 {
-        Ok(())
+        Ok(result)
     } else {
         Err(CatioError::Syscall(errno::from_i32(result)))
     }
 }
 
-pub(super) unsafe fn io_cancel(ctx: IoContext, iocb: *mut Iocb, evt: *mut IoEvent) -> Result<()> {
+pub(super) unsafe fn io_cancel(ctx: IoContext, iocb: *mut Iocb, evt: *mut IoEvent) -> Result<i32> {
     wrap_syscall(io_cancel_sys(ctx, iocb, evt))
 }
 
-pub(super) unsafe fn io_destroy(ctx: IoContext) -> Result<()> {
+pub(super) unsafe fn io_destroy(ctx: IoContext) -> Result<i32> {
     wrap_syscall(io_destroy_sys(ctx))
 }
 
@@ -29,14 +29,14 @@ pub(super) unsafe fn io_getevents(
     nr: c_long,
     events: *mut IoEvent,
     timeout: *mut libc::timespec,
-) -> Result<()> {
+) -> Result<i32> {
     wrap_syscall(io_getevents_sys(ctx, min_nr, nr, events, timeout))
 }
 
-pub(super) unsafe fn io_setup(nr_events: c_int, ctx: *mut IoContext) -> Result<()> {
+pub(super) unsafe fn io_setup(nr_events: c_int, ctx: *mut IoContext) -> Result<i32> {
     wrap_syscall(io_setup_sys(nr_events, ctx))
 }
 
-pub(super) unsafe fn io_submit(ctx: IoContext, nr: c_long, iocb: *mut *mut Iocb) -> Result<()> {
+pub(super) unsafe fn io_submit(ctx: IoContext, nr: c_long, iocb: *mut *mut Iocb) -> Result<i32> {
     wrap_syscall(io_submit_sys(ctx, nr, iocb))
 }

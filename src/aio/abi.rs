@@ -8,6 +8,7 @@ pub(super) type IoContext = c_ulong;
 /// From `linux/include/uabi/linux/aio_abi.h` and
 /// https://github.com/torvalds/linux/blob/4f12b742eb2b3a850ac8be7dc4ed52976fc6cb0b/include/uapi/linux/aio_abi.h#L73-L107
 #[repr(C)]
+#[derive(Debug)]
 pub(super) struct Iocb {
     /// data to be returned in event's data
     pub aio_data: u64,
@@ -40,11 +41,27 @@ pub(super) struct Iocb {
 
 /// From `linux/include/uabi/linux/aio_abi.h`
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(super) struct IoEvent {
-    pub data: u64,
-    pub obj: u64,
-    pub res: i64,
-    pub res2: i64,
+    data: u64,
+    obj: u64,
+    res: i64,
+    res2: i64,
+}
+
+impl IoEvent {
+    pub fn empty() -> Self {
+        Self {
+            data: 0,
+            obj: 0,
+            res: 0,
+            res2: 0,
+        }
+    }
+
+    pub fn data(&self) -> u64 {
+        self.data
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -131,12 +148,7 @@ mod test {
             io_submit(io_context, 1, ios.as_mut_ptr() as *mut *mut Iocb);
         }
 
-        let mut events: [IoEvent; 1] = [IoEvent {
-            data: 0,
-            obj: 0,
-            res: 0,
-            res2: 0,
-        }];
+        let mut events: [IoEvent; 1] = [IoEvent::empty()];
         unsafe {
             io_getevents(io_context, 1, 1, events.as_mut_ptr(), ptr::null_mut());
         }
