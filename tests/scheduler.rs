@@ -1,0 +1,328 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use catio::{Scheduler, TaskClass};
+
+const A: TaskClass = TaskClass::new(1);
+const B: TaskClass = TaskClass::new(2);
+
+struct SaturatedWork {
+    stop: Arc<AtomicBool>,
+    polls: Arc<AtomicU64>,
+}
+
+impl Future for SaturatedWork {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.stop.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        // Every poll performs the same CPU quantum. Keeping the quantum
+        // cooperative makes poll admission a useful proxy for CPU share.
+        for _ in 0..2_000 {
+            std::hint::spin_loop();
+        }
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+#[test]
+fn saturated_runtime_keeps_a_30_b_70() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let scheduler = Scheduler::builder()
+            .max_concurrent_polls(4)
+            .weight(A, 3)
+            .weight(B, 7)
+            .build();
+        let stop = Arc::new(AtomicBool::new(false));
+        let a_polls = Arc::new(AtomicU64::new(0));
+        let b_polls = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        // More runnable tasks than runtime workers keep both class queues
+        // continuously backlogged.
+        for _ in 0..32 {
+            handles.push(scheduler.spawn_in(
+                A,
+                SaturatedWork {
+                    stop: stop.clone(),
+                    polls: a_polls.clone(),
+                },
+            ));
+            handles.push(scheduler.spawn_in(
+                B,
+                SaturatedWork {
+                    stop: stop.clone(),
+                    polls: b_polls.clone(),
+                },
+            ));
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let total = a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed);
+                if total >= 30_000 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("saturated workload made no progress");
+
+        let a_at_capacity = a_polls.load(Ordering::Relaxed);
+        let b_at_capacity = b_polls.load(Ordering::Relaxed);
+        let a_share = a_at_capacity as f64 / (a_at_capacity + b_at_capacity) as f64;
+        assert!(
+            (0.29..=0.31).contains(&a_share),
+            "expected 30% A / 70% B, got A={a_at_capacity}, B={b_at_capacity}, share={a_share}"
+        );
+
+        stop.store(true, Ordering::Release);
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let stats = scheduler.stats();
+        assert_eq!(0, stats.active_polls);
+        assert_eq!(
+            64,
+            stats.classes[&A].completed + stats.classes[&B].completed
+        );
+    });
+}
+
+struct FiniteSelfWaking {
+    remaining: usize,
+}
+
+impl Future for FiniteSelfWaking {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.remaining == 0 {
+            return Poll::Ready(());
+        }
+        self.remaining -= 1;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_classes_do_not_reserve_capacity() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(2)
+        .weight(A, 3)
+        .weight(B, 7)
+        .build();
+
+    let handles = (0..16)
+        .map(|_| scheduler.spawn_in(A, FiniteSelfWaking { remaining: 1_000 }))
+        .collect::<Vec<_>>();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    })
+    .await
+    .expect("A should borrow all capacity while B is idle");
+
+    assert_eq!(16_016, scheduler.stats().classes[&A].polls);
+    assert_eq!(0, scheduler.stats().classes[&B].polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_class_rejoins_without_old_credit_or_debt() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(4)
+        .weight(A, 2)
+        .weight(B, 8)
+        .build();
+
+    let first_stop = Arc::new(AtomicBool::new(false));
+    let first_polls = Arc::new(AtomicU64::new(0));
+    let first_handles = (0..32)
+        .map(|_| {
+            scheduler.spawn_in(
+                A,
+                SaturatedWork {
+                    stop: first_stop.clone(),
+                    polls: first_polls.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    while first_polls.load(Ordering::Relaxed) < 10_000 {
+        tokio::task::yield_now().await;
+    }
+    first_stop.store(true, Ordering::Release);
+    for handle in first_handles {
+        handle.await.unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let a_polls = Arc::new(AtomicU64::new(0));
+    let b_polls = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        handles.push(scheduler.spawn_in(
+            A,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: a_polls.clone(),
+            },
+        ));
+        handles.push(scheduler.spawn_in(
+            B,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: b_polls.clone(),
+            },
+        ));
+    }
+    while a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed) < 30_000 {
+        tokio::task::yield_now().await;
+    }
+
+    let a = a_polls.load(Ordering::Relaxed);
+    let b = b_polls.load(Ordering::Relaxed);
+    let a_share = a as f64 / (a + b) as f64;
+    assert!(
+        (0.19..=0.21).contains(&a_share),
+        "expected A to rejoin at 20%, got A={a}, B={b}, share={a_share}"
+    );
+
+    stop.store(true, Ordering::Release);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+struct CaptureThenReady {
+    polls: Arc<AtomicU64>,
+    captured: Arc<Mutex<Option<Waker>>>,
+}
+
+impl Future for CaptureThenReady {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+        if poll == 0 {
+            *self.captured.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+struct BlockingPoll {
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl Future for BlockingPoll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.started.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        Poll::Ready(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_waker_waits_for_scheduler_admission() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let waiter_polls = Arc::new(AtomicU64::new(0));
+    let captured = Arc::new(Mutex::new(None));
+    let waiter = scheduler.spawn(CaptureThenReady {
+        polls: waiter_polls.clone(),
+        captured: captured.clone(),
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while captured.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let blocker_started = Arc::new(AtomicBool::new(false));
+    let blocker_release = Arc::new(AtomicBool::new(false));
+    let blocker = scheduler.spawn(BlockingPoll {
+        started: blocker_started.clone(),
+        release: blocker_release.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !blocker_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    captured.lock().unwrap().take().unwrap().wake();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        1,
+        waiter_polls.load(Ordering::SeqCst),
+        "the inner wake must queue, not directly wake the Tokio task"
+    );
+
+    blocker_release.store(true, Ordering::Release);
+    blocker.await.unwrap();
+    waiter.await.unwrap();
+    assert_eq!(2, waiter_polls.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_queued_tasks_reclaims_scheduler_state() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let handles = (0..128)
+        .map(|_| {
+            scheduler.spawn(FiniteSelfWaking {
+                remaining: usize::MAX,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tokio::task::yield_now().await;
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        scheduler.spawn(async { "still live" }),
+    )
+    .await
+    .expect("scheduler slot leaked")
+    .unwrap();
+    let stats = scheduler.stats();
+    assert_eq!(0, stats.active_polls);
+    assert_eq!(0, stats.classes[&TaskClass::DEFAULT].queued);
+}
