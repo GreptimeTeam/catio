@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 pub use tokio::task::{yield_now, JoinError, JoinHandle};
 
@@ -389,6 +390,13 @@ pub struct ClassStats {
     pub completed: u64,
     /// Futures dropped or aborted before returning.
     pub cancelled: u64,
+    /// Cumulative wall time from task creation (scheduler entry) to the task's
+    /// first admission (QUEUED -> ADMITTED). This is the scheduler's own
+    /// admission-queue delay, excluding Tokio's local/remote queue and any
+    /// poll execution time.
+    pub total_admission_wait: Duration,
+    /// Tasks that have been admitted at least once.
+    pub admitted: u64,
 }
 
 /// A point-in-time scheduler snapshot.
@@ -409,6 +417,8 @@ struct TaskControl {
     queued: AtomicBool,
     wake_counter: Arc<AtomicU64>,
     executor_waker: Mutex<Option<Waker>>,
+    created: Instant,
+    queued_at: Mutex<Option<Instant>>,
 }
 
 impl TaskControl {
@@ -572,6 +582,8 @@ impl SchedulerInner {
             queued: AtomicBool::new(false),
             wake_counter,
             executor_waker: Mutex::new(None),
+            created: Instant::now(),
+            queued_at: Mutex::new(None),
         })
     }
 
@@ -659,6 +671,7 @@ impl ScheduleState {
         {
             return;
         }
+        *lock(&task.queued_at) = Some(Instant::now());
         let virtual_time = self.virtual_time;
         let class = self.class_mut(task.class);
         if class.queued == 0 {
@@ -695,6 +708,15 @@ impl ScheduleState {
             let selected_pass = class_state.pass;
             class_state.pass = class_state.pass.saturating_add(class_state.stride);
             class_state.stats.polls += 1;
+            class_state.stats.admitted += 1;
+            // Admission wait is the wall time this task spent in the scheduler
+            // queue (queued_at -> ADMITTED), excluding Tokio queueing and
+            // poll execution. Fall back to created.elapsed() only if a task
+            // reached ADMITTED without a queued_at marker.
+            let wait = lock(&task.queued_at)
+                .take()
+                .map_or_else(|| task.created.elapsed(), |queued_at| queued_at.elapsed());
+            class_state.stats.total_admission_wait += wait;
             self.virtual_time = self.virtual_time.max(selected_pass);
             self.active += 1;
             wakers.push(waker);

@@ -11,6 +11,9 @@ mod error;
 mod fs;
 pub mod task;
 
+#[cfg(test)]
+mod admission_wait_tests;
+
 pub use task::{
     default_scheduler, set_default_scheduler, spawn, spawn_in, ClassStats, Scheduled, Scheduler,
     SchedulerBuilder, SchedulerStats, Spawner, TaskClass,
