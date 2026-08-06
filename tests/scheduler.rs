@@ -326,3 +326,81 @@ async fn aborting_queued_tasks_reclaims_scheduler_state() {
     assert_eq!(0, stats.active_polls);
     assert_eq!(0, stats.classes[&TaskClass::DEFAULT].queued);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_weight_change_reallocates_share() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(4)
+        .weight(A, 3)
+        .weight(B, 7)
+        .build();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let a_polls = Arc::new(AtomicU64::new(0));
+    let b_polls = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        handles.push(scheduler.spawn_in(
+            A,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: a_polls.clone(),
+            },
+        ));
+        handles.push(scheduler.spawn_in(
+            B,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: b_polls.clone(),
+            },
+        ));
+    }
+
+    // Let the initial 30/70 allocation run for a while.
+    while a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed) < 20_000 {
+        tokio::task::yield_now().await;
+    }
+    let a_before_flip = a_polls.load(Ordering::Relaxed);
+    let b_before_flip = b_polls.load(Ordering::Relaxed);
+
+    // Flip the weights dynamically: A 3:7 -> 7:3.
+    scheduler.set_weight(A, std::num::NonZeroU32::new(7).unwrap());
+    scheduler.set_weight(B, std::num::NonZeroU32::new(3).unwrap());
+
+    // After the flip, A should dominate the polls.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let a = a_polls.load(Ordering::Relaxed);
+            let b = b_polls.load(Ordering::Relaxed);
+            let a_delta = a - a_before_flip;
+            let b_delta = b - b_before_flip;
+            let total_delta = a_delta + b_delta;
+            if total_delta >= 20_000 && a_delta as f64 / total_delta as f64 >= 0.65 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("dynamic weight flip did not reallocate share");
+
+    let a = a_polls.load(Ordering::Relaxed);
+    let b = b_polls.load(Ordering::Relaxed);
+    let a_delta = (a - a_before_flip) as f64;
+    let total_delta = (a + b - a_before_flip - b_before_flip) as f64;
+    let a_share_after = a_delta / total_delta;
+    assert!(
+        a_share_after >= 0.65,
+        "expected A to dominate after flip, got A={a}, B={b}, share_after={a_share_after}"
+    );
+
+    // The recorded weight in stats should reflect the new value.
+    let stats = scheduler.stats();
+    assert_eq!(7, stats.classes[&A].weight);
+    assert_eq!(3, stats.classes[&B].weight);
+
+    stop.store(true, Ordering::Release);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}

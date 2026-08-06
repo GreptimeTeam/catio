@@ -257,6 +257,22 @@ impl Scheduler {
     pub fn stats(&self) -> SchedulerStats {
         self.inner.stats()
     }
+
+    /// Dynamically changes the weight of a class. The class's stride is
+    /// recomputed and its pass is reset to the current virtual time, so
+    /// historical credit/debt from the old weight does not skew the new
+    /// allocation. Queued tasks are immediately re-dispatched under the new
+    /// weights.
+    pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
+        self.inner.set_weight(class, weight);
+    }
+
+    /// Dynamically changes the maximum number of concurrently admitted polls.
+    /// Raising it admits queued tasks immediately; lowering it stops further
+    /// admissions until active polls drain below the new limit.
+    pub fn set_max_concurrent_polls(&self, limit: usize) {
+        self.inner.set_max_concurrent_polls(limit);
+    }
 }
 
 /// A Tokio-like spawn handle bound to one scheduling class.
@@ -563,8 +579,7 @@ struct SchedulerInner {
 }
 
 impl SchedulerInner {
-    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {
-        let wake_counter = {
+    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {        let wake_counter = {
             let mut state = lock(&self.state);
             let virtual_time = state.virtual_time;
             let class_state = state
@@ -648,6 +663,37 @@ impl SchedulerInner {
             active_polls: state.active,
             classes,
         }
+    }
+
+    fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
+        let wakers = {
+            let mut state = lock(&self.state);
+            // Align this class's pass with the lowest pass among all classes.
+            // Stride scheduling only cares about relative pass values; a class
+            // that accumulated a high pass under a large stride would keep its
+            // low priority forever if we left it alone.
+            let min_pass = state
+                .classes
+                .values()
+                .map(|c| c.pass)
+                .min()
+                .unwrap_or(state.virtual_time);
+            let class_state = state.class_mut(class);
+            class_state.stride = STRIDE_SCALE / u128::from(weight.get());
+            class_state.pass = min_pass;
+            class_state.stats.weight = weight.get();
+            state.dispatch()
+        };
+        wake_all(wakers);
+    }
+
+    fn set_max_concurrent_polls(&self, limit: usize) {
+        let wakers = {
+            let mut state = lock(&self.state);
+            state.max_concurrent_polls = limit;
+            state.dispatch()
+        };
+        wake_all(wakers);
     }
 }
 
