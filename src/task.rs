@@ -259,8 +259,8 @@ impl Scheduler {
     }
 
     /// Dynamically changes the weight of a class. The class's stride is
-    /// recomputed and its pass is reset to the current virtual time, so
-    /// historical credit/debt from the old weight does not skew the new
+    /// recomputed and its pass is reset to the lowest pass among all classes,
+    /// so historical credit/debt from the old weight does not skew the new
     /// allocation. Queued tasks are immediately re-dispatched under the new
     /// weights.
     pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
