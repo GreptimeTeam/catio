@@ -25,7 +25,7 @@ impl Future for SaturatedWork {
 
         // Every poll performs the same CPU quantum. Keeping the quantum
         // cooperative makes poll admission a useful proxy for CPU share.
-        for _ in 0..2_000 {
+        for _ in 0..8_000 {
             std::hint::spin_loop();
         }
         self.polls.fetch_add(1, Ordering::Relaxed);
@@ -86,11 +86,6 @@ fn saturated_runtime_keeps_a_30_b_70() {
 
         let a_at_capacity = a_polls.load(Ordering::Relaxed);
         let b_at_capacity = b_polls.load(Ordering::Relaxed);
-        let a_share = a_at_capacity as f64 / (a_at_capacity + b_at_capacity) as f64;
-        assert!(
-            (0.29..=0.31).contains(&a_share),
-            "expected 30% A / 70% B, got A={a_at_capacity}, B={b_at_capacity}, share={a_share}"
-        );
 
         stop.store(true, Ordering::Release);
         for handle in handles {
@@ -102,6 +97,16 @@ fn saturated_runtime_keeps_a_30_b_70() {
         assert_eq!(
             64,
             stats.classes[&A].completed + stats.classes[&B].completed
+        );
+
+        // Accounting is real execution time: A should hold ~30% of it.
+        let a_exec = stats.classes[&A].total_exec_time.as_secs_f64();
+        let b_exec = stats.classes[&B].total_exec_time.as_secs_f64();
+        let a_share = a_exec / (a_exec + b_exec);
+        assert!(
+            (0.29..=0.31).contains(&a_share),
+            "expected 30% A / 70% B by exec time, got A={a_at_capacity} polls ({a_exec:.3}s), \
+             B={b_at_capacity} polls ({b_exec:.3}s), share={a_share}"
         );
     });
 }
@@ -143,8 +148,18 @@ async fn idle_classes_do_not_reserve_capacity() {
     .await
     .expect("A should borrow all capacity while B is idle");
 
-    assert_eq!(16_016, scheduler.stats().classes[&A].polls);
-    assert_eq!(0, scheduler.stats().classes[&B].polls);
+    let stats = scheduler.stats();
+    // B never ran, so it must hold no exec time; A holds all of it (~100%).
+    assert_eq!(0, stats.classes[&B].polls, "B must not be admitted while idle");
+    assert!(
+        stats.classes[&A].total_exec_time > Duration::ZERO,
+        "A should have accumulated exec time"
+    );
+    assert_eq!(
+        Duration::ZERO,
+        stats.classes[&B].total_exec_time,
+        "idle B must not accumulate exec time"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -176,6 +191,15 @@ async fn an_idle_class_rejoins_without_old_credit_or_debt() {
         handle.await.unwrap();
     }
 
+    // Snapshot A's cumulative exec time after the solo phase so the rejoin
+    // assertion below only measures the 2:8 phase. B never ran in phase 1.
+    let a_exec_after_first = scheduler
+        .stats()
+        .classes
+        .get(&A)
+        .map(|c| c.total_exec_time.as_secs_f64())
+        .unwrap_or(0.0);
+
     let stop = Arc::new(AtomicBool::new(false));
     let a_polls = Arc::new(AtomicU64::new(0));
     let b_polls = Arc::new(AtomicU64::new(0));
@@ -202,16 +226,21 @@ async fn an_idle_class_rejoins_without_old_credit_or_debt() {
 
     let a = a_polls.load(Ordering::Relaxed);
     let b = b_polls.load(Ordering::Relaxed);
-    let a_share = a as f64 / (a + b) as f64;
-    assert!(
-        (0.19..=0.21).contains(&a_share),
-        "expected A to rejoin at 20%, got A={a}, B={b}, share={a_share}"
-    );
 
     stop.store(true, Ordering::Release);
     for handle in handles {
         handle.await.unwrap();
     }
+
+    let stats = scheduler.stats();
+    let a_exec = stats.classes[&A].total_exec_time.as_secs_f64() - a_exec_after_first;
+    let b_exec = stats.classes[&B].total_exec_time.as_secs_f64();
+    let a_share = a_exec / (a_exec + b_exec);
+    assert!(
+        (0.19..=0.21).contains(&a_share),
+        "expected A to rejoin at 20% by exec time, got A={a} polls ({a_exec:.3}s), \
+         B={b} polls ({b_exec:.3}s), share={a_share}"
+    );
 }
 
 struct CaptureThenReady {
@@ -362,6 +391,11 @@ async fn dynamic_weight_change_reallocates_share() {
     }
     let a_before_flip = a_polls.load(Ordering::Relaxed);
     let b_before_flip = b_polls.load(Ordering::Relaxed);
+    // Snapshot exec time so the post-flip assertion measures only the new
+    // allocation, not the initial 30/70 phase.
+    let stats_before_flip = scheduler.stats();
+    let a_exec_before_flip = stats_before_flip.classes[&A].total_exec_time.as_secs_f64();
+    let b_exec_before_flip = stats_before_flip.classes[&B].total_exec_time.as_secs_f64();
 
     // Flip the weights dynamically: A 3:7 -> 7:3.
     scheduler.set_weight(A, std::num::NonZeroU32::new(7).unwrap());
@@ -391,11 +425,20 @@ async fn dynamic_weight_change_reallocates_share() {
     let a_share_after = a_delta / total_delta;
     assert!(
         a_share_after >= 0.65,
-        "expected A to dominate after flip, got A={a}, B={b}, share_after={a_share_after}"
+        "expected A to dominate polls after flip, got A={a}, B={b}, share_after={a_share_after}"
+    );
+
+    // The exec-time share of the post-flip delta must also favor A.
+    let stats = scheduler.stats();
+    let a_exec = stats.classes[&A].total_exec_time.as_secs_f64() - a_exec_before_flip;
+    let b_exec = stats.classes[&B].total_exec_time.as_secs_f64() - b_exec_before_flip;
+    let a_exec_share = a_exec / (a_exec + b_exec);
+    assert!(
+        a_exec_share >= 0.65,
+        "expected A to dominate by exec time after flip, got share={a_exec_share}"
     );
 
     // The recorded weight in stats should reflect the new value.
-    let stats = scheduler.stats();
     assert_eq!(7, stats.classes[&A].weight);
     assert_eq!(3, stats.classes[&B].weight);
 

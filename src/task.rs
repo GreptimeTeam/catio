@@ -24,9 +24,10 @@ const POLLING: u8 = 3;
 const POLLING_NOTIFIED: u8 = 4;
 const FINISHED: u8 = 5;
 
-// A large fixed-point numerator keeps stride rounding irrelevant for practical
-// weights while leaving enormous headroom before a u128 counter can saturate.
-const STRIDE_SCALE: u128 = 1_u128 << 64;
+// A fixed-point numerator for real-execution-time pass accounting: measured
+// nanoseconds are scaled up so rounding is irrelevant for practical weights
+// while leaving enormous headroom before a u128 counter can saturate.
+const TIME_SCALE: u128 = 1_u128 << 32;
 
 /// Identifies a scheduling class.
 ///
@@ -258,11 +259,10 @@ impl Scheduler {
         self.inner.stats()
     }
 
-    /// Dynamically changes the weight of a class. The class's stride is
-    /// recomputed and its pass is reset to the lowest pass among all classes,
-    /// so historical credit/debt from the old weight does not skew the new
-    /// allocation. Queued tasks are immediately re-dispatched under the new
-    /// weights.
+    /// Dynamically changes the weight of a class. The class's pass is realigned
+    /// to the lowest pass among all classes, so historical credit/debt from the
+    /// old weight does not skew the new allocation. Queued tasks are
+    /// immediately re-dispatched under the new weights.
     pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
         self.inner.set_weight(class, weight);
     }
@@ -365,16 +365,21 @@ impl<F: Future> Future for Scheduled<F> {
             return Poll::Pending;
         }
 
+        // Mark the start of the admitted poll so real execution time can be
+        // charged to this class when the poll returns.
+        *lock(&this.control.poll_started_at) = Some(Instant::now());
+
         let proxy_waker = Waker::from(this.control.clone());
         let mut proxy_context = Context::from_waker(&proxy_waker);
+        let started = lock(&this.control.poll_started_at).take();
         match this.future.as_mut().poll(&mut proxy_context) {
             Poll::Ready(output) => {
-                this.control.finish_ready();
+                this.control.finish_ready(started.map(|t| t.elapsed()));
                 this.returned = true;
                 Poll::Ready(output)
             }
             Poll::Pending => {
-                this.control.finish_pending();
+                this.control.finish_pending(started.map(|t| t.elapsed()));
                 Poll::Pending
             }
         }
@@ -411,6 +416,10 @@ pub struct ClassStats {
     /// admission-queue delay, excluding Tokio's local/remote queue and any
     /// poll execution time.
     pub total_admission_wait: Duration,
+    /// Cumulative real execution time this class's futures spent inside
+    /// admitted polls (poll start -> poll return). Aborted or cancelled polls
+    /// are deliberately not charged.
+    pub total_exec_time: Duration,
     /// Tasks that have been admitted at least once.
     pub admitted: u64,
 }
@@ -435,6 +444,7 @@ struct TaskControl {
     executor_waker: Mutex<Option<Waker>>,
     created: Instant,
     queued_at: Mutex<Option<Instant>>,
+    poll_started_at: Mutex<Option<Instant>>,
 }
 
 impl TaskControl {
@@ -514,7 +524,7 @@ impl TaskControl {
         }
     }
 
-    fn finish_pending(self: &Arc<Self>) {
+    fn finish_pending(self: &Arc<Self>, exec_time: Option<Duration>) {
         loop {
             match self.state.load(Ordering::Acquire) {
                 POLLING => {
@@ -523,7 +533,7 @@ impl TaskControl {
                         .compare_exchange(POLLING, IDLE, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.scheduler.finish_poll(None, self.class, false);
+                        self.scheduler.finish_poll(None, self.class, false, exec_time);
                         return;
                     }
                 }
@@ -538,7 +548,7 @@ impl TaskControl {
                         )
                         .is_ok()
                     {
-                        self.scheduler.finish_poll(Some(self), self.class, false);
+                        self.scheduler.finish_poll(Some(self), self.class, false, exec_time);
                         return;
                     }
                 }
@@ -547,10 +557,10 @@ impl TaskControl {
         }
     }
 
-    fn finish_ready(self: &Arc<Self>) {
+    fn finish_ready(self: &Arc<Self>, exec_time: Option<Duration>) {
         let previous = self.state.swap(FINISHED, Ordering::AcqRel);
         debug_assert!(matches!(previous, POLLING | POLLING_NOTIFIED));
-        self.scheduler.finish_poll(None, self.class, true);
+        self.scheduler.finish_poll(None, self.class, true, exec_time);
     }
 
     fn cancel(self: &Arc<Self>) {
@@ -558,6 +568,10 @@ impl TaskControl {
         if previous == FINISHED {
             return;
         }
+
+        // An aborted poll must not charge exec time: drop the start marker
+        // without recording. This asymmetry with poll accounting is deliberate.
+        let _poll_started_at = lock(&self.poll_started_at).take();
 
         let held_admission = matches!(previous, ADMITTED | POLLING | POLLING_NOTIFIED);
         self.scheduler.cancel(self, held_admission);
@@ -599,6 +613,7 @@ impl SchedulerInner {
             executor_waker: Mutex::new(None),
             created: Instant::now(),
             queued_at: Mutex::new(None),
+            poll_started_at: Mutex::new(None),
         })
     }
 
@@ -611,12 +626,30 @@ impl SchedulerInner {
         wake_all(wakers);
     }
 
-    fn finish_poll(&self, requeue: Option<&Arc<TaskControl>>, class: TaskClass, completed: bool) {
+    fn finish_poll(
+        &self,
+        requeue: Option<&Arc<TaskControl>>,
+        class: TaskClass,
+        completed: bool,
+        exec_time: Option<Duration>,
+    ) {
         let wakers = {
             let mut state = lock(&self.state);
+            // Read the concurrency before releasing this poll's slot: the exec
+            // time it charged was spent sharing the machine with `active`
+            // concurrent polls, so the pass increment is divided accordingly.
+            let active_at_finish = state.active.max(1);
             state.active = state.active.saturating_sub(1);
             if completed {
                 state.class_mut(class).stats.completed += 1;
+            }
+            if let Some(t) = exec_time {
+                let cs = state.class_mut(class);
+                cs.pass = cs.pass.saturating_add(
+                    t.as_nanos() * TIME_SCALE
+                        / (u128::from(cs.stats.weight) * active_at_finish as u128),
+                );
+                cs.stats.total_exec_time += t;
             }
             if let Some(task) = requeue {
                 state.enqueue(task);
@@ -669,8 +702,8 @@ impl SchedulerInner {
         let wakers = {
             let mut state = lock(&self.state);
             // Align this class's pass with the lowest pass among all classes.
-            // Stride scheduling only cares about relative pass values; a class
-            // that accumulated a high pass under a large stride would keep its
+            // Pass scheduling only cares about relative pass values; a class
+            // that accumulated a high pass under the old weight would keep its
             // low priority forever if we left it alone.
             let min_pass = state
                 .classes
@@ -679,7 +712,6 @@ impl SchedulerInner {
                 .min()
                 .unwrap_or(state.virtual_time);
             let class_state = state.class_mut(class);
-            class_state.stride = STRIDE_SCALE / u128::from(weight.get());
             class_state.pass = min_pass;
             class_state.stats.weight = weight.get();
             state.dispatch()
@@ -752,7 +784,6 @@ impl ScheduleState {
                 .get_mut(&class)
                 .expect("queued class must exist");
             let selected_pass = class_state.pass;
-            class_state.pass = class_state.pass.saturating_add(class_state.stride);
             class_state.stats.polls += 1;
             class_state.stats.admitted += 1;
             // Admission wait is the wall time this task spent in the scheduler
@@ -798,7 +829,6 @@ impl ScheduleState {
 }
 
 struct ClassState {
-    stride: u128,
     pass: u128,
     queued: usize,
     queue: VecDeque<Weak<TaskControl>>,
@@ -809,7 +839,6 @@ struct ClassState {
 impl ClassState {
     fn new(weight: NonZeroU32, pass: u128) -> Self {
         Self {
-            stride: STRIDE_SCALE / u128::from(weight.get()),
             pass,
             queued: 0,
             queue: VecDeque::new(),
