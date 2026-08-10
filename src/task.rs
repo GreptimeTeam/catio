@@ -147,11 +147,12 @@ impl SchedulerBuilder {
             inner: Arc::new(SchedulerInner {
                 state: Mutex::new(ScheduleState {
                     max_concurrent_polls: self.max_concurrent_polls,
-                    sample_every_polls: self.sample_every_polls,
                     active: 0,
                     virtual_time: 0,
                     classes,
                 }),
+                sample_every_polls: self.sample_every_polls,
+                poll_counters: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -472,6 +473,10 @@ struct TaskControl {
     state: AtomicU8,
     queued: AtomicBool,
     wake_counter: Arc<AtomicU64>,
+    // Per-class poll counter backing downsampled clock sampling. Every task of
+    // a class shares the same Arc, so each poll bumps it with a lock-free
+    // `fetch_add` — no scheduler lock is touched on the hot path.
+    poll_counter: Arc<AtomicU64>,
     executor_waker: Mutex<Option<Waker>>,
     created: Instant,
     queued_at: Mutex<Option<Instant>>,
@@ -499,13 +504,16 @@ impl TaskControl {
     /// Decides whether this poll should stamp `poll_started_at`.
     ///
     /// With the default every-poll sampling this is a plain field read. With
-    /// downsampling it bumps the class poll counter under the scheduler lock
-    /// and samples every N-th poll.
+    /// downsampling it bumps the class poll counter with a single lock-free
+    /// atomic `fetch_add` (the counter Arc is shared by every task of the
+    /// class) and samples every N-th poll.
     fn should_sample_poll(&self) -> bool {
         if self.sample_always {
             return true;
         }
-        self.scheduler.should_sample_poll(self.class)
+        let every = self.scheduler.sample_every_polls;
+        debug_assert!(every > 1);
+        self.poll_counter.fetch_add(1, Ordering::Relaxed) % every as u64 == 0
     }
 
     fn begin_poll(self: &Arc<Self>) -> bool {
@@ -636,13 +644,31 @@ impl Wake for TaskControl {
 
 struct SchedulerInner {
     state: Mutex<ScheduleState>,
+    // Clock sampling frequency (N). Immutable after build, so the poll hot
+    // path reads it without any lock.
+    sample_every_polls: usize,
+    // Per-class poll counters backing downsampled sampling. The map structure
+    // changes only when a class first appears (task creation, under the map
+    // lock); each task caches its class's Arc and bumps it lock-free.
+    poll_counters: Mutex<BTreeMap<TaskClass, Arc<AtomicU64>>>,
 }
 
 impl SchedulerInner {
-    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {        let (wake_counter, sample_always) = {
+    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {
+        // Task creation is infrequent, so the per-class counter is fetched
+        // here under the map lock; the returned Arc is then bumped lock-free
+        // on every poll (see TaskControl::should_sample_poll).
+        let poll_counter = {
+            let mut counters = lock(&self.poll_counters);
+            counters
+                .entry(class)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                .clone()
+        };
+        let (wake_counter, sample_always) = {
             let mut state = lock(&self.state);
             let virtual_time = state.virtual_time;
-            let sample_always = state.sample_every_polls <= 1;
+            let sample_always = self.sample_every_polls <= 1;
             let class_state = state
                 .classes
                 .entry(class)
@@ -657,23 +683,13 @@ impl SchedulerInner {
             state: AtomicU8::new(IDLE),
             queued: AtomicBool::new(false),
             wake_counter,
+            poll_counter,
             executor_waker: Mutex::new(None),
             created: Instant::now(),
             queued_at: Mutex::new(None),
             poll_started_at: Mutex::new(None),
             sample_always,
         })
-    }
-
-    /// Bumps the class poll counter and reports whether this poll is one of
-    /// the sampled every N-th polls. Only called when downsampling is active.
-    fn should_sample_poll(&self, class: TaskClass) -> bool {
-        let mut state = lock(&self.state);
-        let sample_every = state.sample_every_polls;
-        debug_assert!(sample_every > 1);
-        let cs = state.class_mut(class);
-        cs.poll_counter = cs.poll_counter.wrapping_add(1);
-        cs.poll_counter % sample_every as u64 == 0
     }
 
     fn enqueue(&self, task: &Arc<TaskControl>) {
@@ -753,7 +769,7 @@ impl SchedulerInner {
         SchedulerStats {
             max_concurrent_polls: state.max_concurrent_polls,
             active_polls: state.active,
-            sample_every_polls: state.sample_every_polls,
+            sample_every_polls: self.sample_every_polls,
             classes,
         }
     }
@@ -791,7 +807,6 @@ impl SchedulerInner {
 
 struct ScheduleState {
     max_concurrent_polls: usize,
-    sample_every_polls: usize,
     active: usize,
     virtual_time: u128,
     classes: BTreeMap<TaskClass, ClassState>,
@@ -895,10 +910,6 @@ struct ClassState {
     queue: VecDeque<Weak<TaskControl>>,
     wakes: Arc<AtomicU64>,
     stats: ClassStats,
-    // Class-wide poll counter driving downsampled clock sampling: with
-    // sample_every_polls = N, polls with counter % N == 0 stamp a start
-    // marker; the others are not charged.
-    poll_counter: u64,
 }
 
 impl ClassState {
@@ -912,7 +923,6 @@ impl ClassState {
                 weight: weight.get(),
                 ..ClassStats::default()
             },
-            poll_counter: 0,
         }
     }
 }
