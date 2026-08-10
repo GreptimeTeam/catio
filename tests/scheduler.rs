@@ -447,3 +447,89 @@ async fn dynamic_weight_change_reallocates_share() {
         handle.await.unwrap();
     }
 }
+
+/// With time accounting disabled the scheduler must fall back to pure
+/// count-based stride accounting: no clock is read on the poll path
+/// (`total_exec_time` stays zero), all tasks still complete, and with
+/// equal-length polls the poll share converges to the configured weights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn time_accounting_disabled_uses_count_accounting() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(4)
+        .weight(A, 3)
+        .weight(B, 7)
+        .time_accounting(false)
+        .build();
+    assert!(!scheduler.stats().time_accounting, "flag must be exposed");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let a_polls = Arc::new(AtomicU64::new(0));
+    let b_polls = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        handles.push(scheduler.spawn_in(
+            A,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: a_polls.clone(),
+            },
+        ));
+        handles.push(scheduler.spawn_in(
+            B,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: b_polls.clone(),
+            },
+        ));
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let total = a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed);
+            if total >= 30_000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("saturated workload made no progress");
+
+    let a_at_capacity = a_polls.load(Ordering::Relaxed);
+    let b_at_capacity = b_polls.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Release);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let stats = scheduler.stats();
+    assert_eq!(0, stats.active_polls);
+    assert_eq!(
+        64,
+        stats.classes[&A].completed + stats.classes[&B].completed
+    );
+    assert!(!stats.time_accounting);
+
+    // Count accounting never touches the clock: no exec time is recorded.
+    assert_eq!(
+        Duration::ZERO,
+        stats.classes[&A].total_exec_time,
+        "time accounting disabled must not accumulate exec time"
+    );
+    assert_eq!(
+        Duration::ZERO,
+        stats.classes[&B].total_exec_time,
+        "time accounting disabled must not accumulate exec time"
+    );
+
+    // Equal-length polls under count accounting converge to the weight ratio
+    // (3:7 -> A ~30% of admissions).
+    let total = a_at_capacity + b_at_capacity;
+    let a_share = a_at_capacity as f64 / total as f64;
+    assert!(
+        (0.27..=0.33).contains(&a_share),
+        "expected ~30% A by count accounting, got A={a_at_capacity} polls \
+         ({a_share:.3}), B={b_at_capacity} polls"
+    );
+}

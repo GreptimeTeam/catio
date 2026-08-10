@@ -63,6 +63,7 @@ pub struct SchedulerBuilder {
     max_concurrent_polls: usize,
     weights: BTreeMap<TaskClass, NonZeroU32>,
     sample_every_polls: usize,
+    time_accounting: bool,
 }
 
 impl Default for SchedulerBuilder {
@@ -77,6 +78,7 @@ impl Default for SchedulerBuilder {
             max_concurrent_polls,
             weights,
             sample_every_polls: 1,
+            time_accounting: true,
         }
     }
 }
@@ -135,8 +137,25 @@ impl SchedulerBuilder {
         self
     }
 
+    /// Selects the accounting mode.
+    ///
+    /// `true` (the default) charges each class by the real execution time its
+    /// admitted polls spend in Tokio: the poll hot path reads
+    /// [`Instant::now()`] once when an admitted poll starts and once when it
+    /// returns. `false` disables time accounting entirely and reverts to pure
+    /// count-based stride accounting: every admission charges the class a
+    /// fixed stride (`TIME_SCALE / weight`) and **no clock is read on the poll
+    /// hot path** (`poll_started_at` is neither written nor read, and
+    /// `ClassStats::total_exec_time` stays zero). This is meant for measuring
+    /// the scheduling overhead of the two `Instant::now()` calls themselves.
+    pub fn time_accounting(mut self, enabled: bool) -> Self {
+        self.time_accounting = enabled;
+        self
+    }
+
     /// Creates the scheduler.
     pub fn build(self) -> Scheduler {
+        let time_accounting = self.time_accounting;
         let classes = self
             .weights
             .into_iter()
@@ -149,9 +168,11 @@ impl SchedulerBuilder {
                     max_concurrent_polls: self.max_concurrent_polls,
                     active: 0,
                     virtual_time: 0,
+                    time_accounting,
                     classes,
                 }),
                 sample_every_polls: self.sample_every_polls,
+                time_accounting,
                 poll_counters: Mutex::new(BTreeMap::new()),
             }),
         }
@@ -393,14 +414,20 @@ impl<F: Future> Future for Scheduled<F> {
         // charged to this class when the poll returns. With downsampled
         // sampling (sample_every_polls > 1) only every N-th poll in the class
         // stamps a marker; unstamped polls yield exec_time=None and are not
-        // charged (their execution time is approximated as zero).
-        if this.control.should_sample_poll() {
+        // charged (their execution time is approximated as zero). With time
+        // accounting disabled no marker is ever stamped: the poll path reads
+        // no clock at all and the fixed stride is charged at admission.
+        if this.control.time_accounting && this.control.should_sample_poll() {
             *lock(&this.control.poll_started_at) = Some(Instant::now());
         }
 
         let proxy_waker = Waker::from(this.control.clone());
         let mut proxy_context = Context::from_waker(&proxy_waker);
-        let started = lock(&this.control.poll_started_at).take();
+        let started = if this.control.time_accounting {
+            lock(&this.control.poll_started_at).take()
+        } else {
+            None
+        };
         match this.future.as_mut().poll(&mut proxy_context) {
             Poll::Ready(output) => {
                 this.control.finish_ready(started.map(|t| t.elapsed()));
@@ -463,6 +490,9 @@ pub struct SchedulerStats {
     /// Clock sampling frequency: one start marker is stamped per this many
     /// polls in each class (1 = every poll, the default).
     pub sample_every_polls: usize,
+    /// Accounting mode: `true` = real-execution-time accounting (default),
+    /// `false` = pure count accounting with no clock reads on the poll path.
+    pub time_accounting: bool,
     /// Counters keyed by scheduling class.
     pub classes: BTreeMap<TaskClass, ClassStats>,
 }
@@ -484,6 +514,9 @@ struct TaskControl {
     // Hot-path cache of `sample_every_polls <= 1`: when the scheduler samples
     // every poll, stamping needs no lock on the scheduler state.
     sample_always: bool,
+    // Hot-path cache of the accounting mode: when false the poll path skips
+    // both `Instant::now()` reads (no stamp, no take).
+    time_accounting: bool,
 }
 
 impl TaskControl {
@@ -647,6 +680,10 @@ struct SchedulerInner {
     // Clock sampling frequency (N). Immutable after build, so the poll hot
     // path reads it without any lock.
     sample_every_polls: usize,
+    // Accounting mode: true = real-execution-time accounting, false = pure
+    // count accounting (no clock reads on the poll path). Immutable after
+    // build; cached per-task in TaskControl.
+    time_accounting: bool,
     // Per-class poll counters backing downsampled sampling. The map structure
     // changes only when a class first appears (task creation, under the map
     // lock); each task caches its class's Arc and bumps it lock-free.
@@ -689,6 +726,7 @@ impl SchedulerInner {
             queued_at: Mutex::new(None),
             poll_started_at: Mutex::new(None),
             sample_always,
+            time_accounting: self.time_accounting,
         })
     }
 
@@ -770,6 +808,7 @@ impl SchedulerInner {
             max_concurrent_polls: state.max_concurrent_polls,
             active_polls: state.active,
             sample_every_polls: self.sample_every_polls,
+            time_accounting: self.time_accounting,
             classes,
         }
     }
@@ -789,6 +828,7 @@ impl SchedulerInner {
                 .unwrap_or(state.virtual_time);
             let class_state = state.class_mut(class);
             class_state.pass = min_pass;
+            class_state.stride = TIME_SCALE / u128::from(weight.get());
             class_state.stats.weight = weight.get();
             state.dispatch()
         };
@@ -809,6 +849,7 @@ struct ScheduleState {
     max_concurrent_polls: usize,
     active: usize,
     virtual_time: u128,
+    time_accounting: bool,
     classes: BTreeMap<TaskClass, ClassState>,
 }
 
@@ -871,6 +912,14 @@ impl ScheduleState {
                 .map_or_else(|| task.created.elapsed(), |queued_at| queued_at.elapsed());
             class_state.stats.total_admission_wait += wait;
             self.virtual_time = self.virtual_time.max(selected_pass);
+            // Pure count accounting (time accounting disabled): charge the
+            // precomputed stride per admission instead of measuring real
+            // execution time in finish_poll. `stride = TIME_SCALE / weight` is
+            // computed once per class (build / set_weight), so the hot path is
+            // a single u128 add — no division and no clock reads.
+            if !self.time_accounting {
+                class_state.pass = class_state.pass.saturating_add(class_state.stride);
+            }
             self.active += 1;
             wakers.push(waker);
         }
@@ -905,6 +954,7 @@ impl ScheduleState {
 }
 
 struct ClassState {
+    stride: u128,
     pass: u128,
     queued: usize,
     queue: VecDeque<Weak<TaskControl>>,
@@ -915,6 +965,7 @@ struct ClassState {
 impl ClassState {
     fn new(weight: NonZeroU32, pass: u128) -> Self {
         Self {
+            stride: TIME_SCALE / u128::from(weight.get()),
             pass,
             queued: 0,
             queue: VecDeque::new(),
