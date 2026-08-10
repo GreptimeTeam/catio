@@ -62,6 +62,7 @@ impl fmt::Display for TaskClass {
 pub struct SchedulerBuilder {
     max_concurrent_polls: usize,
     weights: BTreeMap<TaskClass, NonZeroU32>,
+    sample_every_polls: usize,
 }
 
 impl Default for SchedulerBuilder {
@@ -75,6 +76,7 @@ impl Default for SchedulerBuilder {
         Self {
             max_concurrent_polls,
             weights,
+            sample_every_polls: 1,
         }
     }
 }
@@ -113,6 +115,26 @@ impl SchedulerBuilder {
         self
     }
 
+    /// Samples the clock on every N-th poll per class instead of every poll.
+    ///
+    /// The scheduler charges real execution time to a class by stamping
+    /// [`Instant::now()`] when an admitted poll starts and measuring its
+    /// elapsed time when the poll returns. With the default `1`, every poll is
+    /// stamped, which is exactly how the scheduler behaved before this option
+    /// existed. Setting `N > 1` stamps only every N-th poll in each class, and
+    /// **unstamped polls are not charged at all**: their execution time is
+    /// approximated as zero. This trades accounting/fairness precision for
+    /// lower per-poll overhead; it is meant for measuring the cost of time
+    /// sampling itself (every-poll vs. downsampled).
+    ///
+    /// The poll counter is per scheduling class, so the N-poll sampling rhythm
+    /// is global within a class rather than per task. Values `0` and `1` are
+    /// both treated as "sample every poll".
+    pub fn sample_every_polls(mut self, every: usize) -> Self {
+        self.sample_every_polls = every.max(1);
+        self
+    }
+
     /// Creates the scheduler.
     pub fn build(self) -> Scheduler {
         let classes = self
@@ -125,6 +147,7 @@ impl SchedulerBuilder {
             inner: Arc::new(SchedulerInner {
                 state: Mutex::new(ScheduleState {
                     max_concurrent_polls: self.max_concurrent_polls,
+                    sample_every_polls: self.sample_every_polls,
                     active: 0,
                     virtual_time: 0,
                     classes,
@@ -366,8 +389,13 @@ impl<F: Future> Future for Scheduled<F> {
         }
 
         // Mark the start of the admitted poll so real execution time can be
-        // charged to this class when the poll returns.
-        *lock(&this.control.poll_started_at) = Some(Instant::now());
+        // charged to this class when the poll returns. With downsampled
+        // sampling (sample_every_polls > 1) only every N-th poll in the class
+        // stamps a marker; unstamped polls yield exec_time=None and are not
+        // charged (their execution time is approximated as zero).
+        if this.control.should_sample_poll() {
+            *lock(&this.control.poll_started_at) = Some(Instant::now());
+        }
 
         let proxy_waker = Waker::from(this.control.clone());
         let mut proxy_context = Context::from_waker(&proxy_waker);
@@ -431,6 +459,9 @@ pub struct SchedulerStats {
     pub max_concurrent_polls: usize,
     /// Currently admitted polls.
     pub active_polls: usize,
+    /// Clock sampling frequency: one start marker is stamped per this many
+    /// polls in each class (1 = every poll, the default).
+    pub sample_every_polls: usize,
     /// Counters keyed by scheduling class.
     pub classes: BTreeMap<TaskClass, ClassStats>,
 }
@@ -445,6 +476,9 @@ struct TaskControl {
     created: Instant,
     queued_at: Mutex<Option<Instant>>,
     poll_started_at: Mutex<Option<Instant>>,
+    // Hot-path cache of `sample_every_polls <= 1`: when the scheduler samples
+    // every poll, stamping needs no lock on the scheduler state.
+    sample_always: bool,
 }
 
 impl TaskControl {
@@ -460,6 +494,18 @@ impl TaskControl {
 
     fn executor_waker(&self) -> Option<Waker> {
         lock(&self.executor_waker).clone()
+    }
+
+    /// Decides whether this poll should stamp `poll_started_at`.
+    ///
+    /// With the default every-poll sampling this is a plain field read. With
+    /// downsampling it bumps the class poll counter under the scheduler lock
+    /// and samples every N-th poll.
+    fn should_sample_poll(&self) -> bool {
+        if self.sample_always {
+            return true;
+        }
+        self.scheduler.should_sample_poll(self.class)
     }
 
     fn begin_poll(self: &Arc<Self>) -> bool {
@@ -593,15 +639,16 @@ struct SchedulerInner {
 }
 
 impl SchedulerInner {
-    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {        let wake_counter = {
+    fn new_task(self: &Arc<Self>, class: TaskClass) -> Arc<TaskControl> {        let (wake_counter, sample_always) = {
             let mut state = lock(&self.state);
             let virtual_time = state.virtual_time;
+            let sample_always = state.sample_every_polls <= 1;
             let class_state = state
                 .classes
                 .entry(class)
                 .or_insert_with(|| ClassState::new(NonZeroU32::MIN, virtual_time));
             class_state.stats.tasks += 1;
-            class_state.wakes.clone()
+            (class_state.wakes.clone(), sample_always)
         };
 
         Arc::new(TaskControl {
@@ -614,7 +661,19 @@ impl SchedulerInner {
             created: Instant::now(),
             queued_at: Mutex::new(None),
             poll_started_at: Mutex::new(None),
+            sample_always,
         })
+    }
+
+    /// Bumps the class poll counter and reports whether this poll is one of
+    /// the sampled every N-th polls. Only called when downsampling is active.
+    fn should_sample_poll(&self, class: TaskClass) -> bool {
+        let mut state = lock(&self.state);
+        let sample_every = state.sample_every_polls;
+        debug_assert!(sample_every > 1);
+        let cs = state.class_mut(class);
+        cs.poll_counter = cs.poll_counter.wrapping_add(1);
+        cs.poll_counter % sample_every as u64 == 0
     }
 
     fn enqueue(&self, task: &Arc<TaskControl>) {
@@ -694,6 +753,7 @@ impl SchedulerInner {
         SchedulerStats {
             max_concurrent_polls: state.max_concurrent_polls,
             active_polls: state.active,
+            sample_every_polls: state.sample_every_polls,
             classes,
         }
     }
@@ -731,6 +791,7 @@ impl SchedulerInner {
 
 struct ScheduleState {
     max_concurrent_polls: usize,
+    sample_every_polls: usize,
     active: usize,
     virtual_time: u128,
     classes: BTreeMap<TaskClass, ClassState>,
@@ -834,6 +895,10 @@ struct ClassState {
     queue: VecDeque<Weak<TaskControl>>,
     wakes: Arc<AtomicU64>,
     stats: ClassStats,
+    // Class-wide poll counter driving downsampled clock sampling: with
+    // sample_every_polls = N, polls with counter % N == 0 stamp a start
+    // marker; the others are not charged.
+    poll_counter: u64,
 }
 
 impl ClassState {
@@ -847,6 +912,7 @@ impl ClassState {
                 weight: weight.get(),
                 ..ClassStats::default()
             },
+            poll_counter: 0,
         }
     }
 }
@@ -921,4 +987,132 @@ where
     F::Output: Send + 'static,
 {
     default_scheduler().spawn_in(class, future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLASS_A: TaskClass = TaskClass::new(1);
+    const CLASS_B: TaskClass = TaskClass::new(2);
+
+    /// A future that polls `rounds` times before returning, doing a small
+    /// amount of work per poll so elapsed time is measurable.
+    struct CountingWork {
+        polls: Arc<AtomicU64>,
+        rounds: u32,
+    }
+
+    impl Future for CountingWork {
+        type Output = u64;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            for _ in 0..4_000 {
+                std::hint::spin_loop();
+            }
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.rounds == 0 {
+                return Poll::Ready(self.polls.load(Ordering::Relaxed));
+            }
+            self.rounds -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn sample_every_polls_defaults_to_one() {
+        let scheduler = Scheduler::builder().build();
+        assert_eq!(scheduler.stats().sample_every_polls, 1);
+
+        // 0 is normalized to "every poll", same as the default.
+        let scheduler = Scheduler::builder().sample_every_polls(0).build();
+        assert_eq!(scheduler.stats().sample_every_polls, 1);
+    }
+
+    /// With the default every-poll sampling, executed polls are charged:
+    /// `total_exec_time` grows past zero, matching the pre-sampling behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_sampling_records_exec_time() {
+        let scheduler = Scheduler::builder()
+            .max_concurrent_polls(2)
+            .build();
+        assert_eq!(scheduler.stats().sample_every_polls, 1);
+
+        let polls = Arc::new(AtomicU64::new(0));
+        let handle = scheduler.spawn_in(
+            CLASS_A,
+            CountingWork {
+                polls: polls.clone(),
+                rounds: 10,
+            },
+        );
+        handle.await.unwrap();
+
+        let stats = scheduler.stats();
+        let class = stats.classes.get(&CLASS_A).expect("class must exist");
+        assert!(class.total_exec_time > Duration::ZERO);
+        assert!(class.polls >= 11, "expected at least 11 polls, got {}", class.polls);
+    }
+
+    /// Downsampled sampling must not break scheduling: all tasks still
+    /// complete, both classes keep making progress, and the configuration is
+    /// exposed through `stats()`. Unsampled polls are not charged, but the
+    /// sampled ones still record nonzero execution time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn downsampled_scheduler_still_completes_work() {
+        let scheduler = Scheduler::builder()
+            .sample_every_polls(2)
+            .max_concurrent_polls(2)
+            .build();
+        assert_eq!(scheduler.stats().sample_every_polls, 2);
+
+        let a_polls = Arc::new(AtomicU64::new(0));
+        let b_polls = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(scheduler.spawn_in(
+                CLASS_A,
+                CountingWork {
+                    polls: a_polls.clone(),
+                    rounds: 10,
+                },
+            ));
+            handles.push(scheduler.spawn_in(
+                CLASS_B,
+                CountingWork {
+                    polls: b_polls.clone(),
+                    rounds: 10,
+                },
+            ));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let stats = scheduler.stats();
+        assert_eq!(stats.sample_every_polls, 2);
+        let total_polls = a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed);
+        assert!(
+            a_polls.load(Ordering::Relaxed) * 100 / total_polls >= 20,
+            "class A starved: {}/{} polls",
+            a_polls.load(Ordering::Relaxed),
+            total_polls
+        );
+        assert!(
+            b_polls.load(Ordering::Relaxed) * 100 / total_polls >= 20,
+            "class B starved: {}/{} polls",
+            b_polls.load(Ordering::Relaxed),
+            total_polls
+        );
+
+        // Every-other-poll sampling still charges the sampled polls, so at
+        // least one class records nonzero execution time.
+        let a = stats.classes.get(&CLASS_A).expect("class A must exist");
+        let b = stats.classes.get(&CLASS_B).expect("class B must exist");
+        assert!(
+            a.total_exec_time > Duration::ZERO || b.total_exec_time > Duration::ZERO,
+            "downsampled polls must still record some execution time"
+        );
+    }
 }
