@@ -57,11 +57,67 @@ impl fmt::Display for TaskClass {
     }
 }
 
+/// A positive, fixed-point soft CPU limit measured in milli-cores.
+///
+/// This is a relative, work-conserving entitlement while classes contend for
+/// the scheduler. It is not a hard CPU cap: an active class borrows capacity
+/// from configured classes that are idle.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SoftCpuLimit(NonZeroU32);
+
+impl SoftCpuLimit {
+    /// Creates a limit from milli-cores. Zero is not a valid limit.
+    pub const fn from_millicores(millicores: u32) -> Option<Self> {
+        match NonZeroU32::new(millicores) {
+            Some(millicores) => Some(Self(millicores)),
+            None => None,
+        }
+    }
+
+    /// Creates a limit from whole CPU cores. Zero and overflow are rejected.
+    pub const fn from_cores(cores: u32) -> Option<Self> {
+        match cores.checked_mul(1_000) {
+            Some(millicores) => Self::from_millicores(millicores),
+            None => None,
+        }
+    }
+
+    /// Returns this limit in milli-cores.
+    pub const fn millicores(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClassConfig {
+    // Zero is the public `ClassStats::weight` sentinel for soft-limit classes.
+    legacy_weight: u32,
+    entitlement_millicores: u64,
+}
+
+impl ClassConfig {
+    const fn legacy(weight: NonZeroU32) -> Self {
+        Self {
+            legacy_weight: weight.get(),
+            entitlement_millicores: weight.get() as u64 * 1_000,
+        }
+    }
+
+    const fn soft(limit: SoftCpuLimit) -> Self {
+        Self {
+            // Zero was never a valid legacy weight, so it is a stable public
+            // sentinel for classes configured through the soft-limit API.
+            legacy_weight: 0,
+            entitlement_millicores: limit.millicores() as u64,
+        }
+    }
+}
+
 /// Builds a weighted scheduler.
 #[derive(Clone, Debug)]
 pub struct SchedulerBuilder {
     max_concurrent_polls: usize,
-    weights: BTreeMap<TaskClass, NonZeroU32>,
+    weights: BTreeMap<TaskClass, ClassConfig>,
     sample_every_polls: usize,
 }
 
@@ -71,7 +127,7 @@ impl Default for SchedulerBuilder {
             .map(usize::from)
             .unwrap_or(1);
         let mut weights = BTreeMap::new();
-        weights.insert(TaskClass::DEFAULT, NonZeroU32::MIN);
+        weights.insert(TaskClass::DEFAULT, ClassConfig::legacy(NonZeroU32::MIN));
 
         Self {
             max_concurrent_polls,
@@ -111,7 +167,18 @@ impl SchedulerBuilder {
     /// Panics when `weight` is zero.
     pub fn weight(mut self, class: TaskClass, weight: u32) -> Self {
         let weight = NonZeroU32::new(weight).expect("class weight must be greater than zero");
-        self.weights.insert(class, weight);
+        self.weights.insert(class, ClassConfig::legacy(weight));
+        self
+    }
+
+    /// Sets a class's soft CPU limit in milli-cores.
+    ///
+    /// Limits are relative work-conserving entitlements under contention, not
+    /// hard caps. Idle classes reserve no CPU capacity. Legacy
+    /// [`Self::weight`] values are converted to whole-core milli-core shares,
+    /// so `weight(class, 2)` and a two-core soft limit have equal shares.
+    pub fn soft_cpu_limit(mut self, class: TaskClass, limit: SoftCpuLimit) -> Self {
+        self.weights.insert(class, ClassConfig::soft(limit));
         self
     }
 
@@ -140,7 +207,7 @@ impl SchedulerBuilder {
         let classes = self
             .weights
             .into_iter()
-            .map(|(class, weight)| (class, ClassState::new(weight, 0)))
+            .map(|(class, config)| (class, ClassState::new(config, 0)))
             .collect();
 
         Scheduler {
@@ -283,12 +350,30 @@ impl Scheduler {
         self.inner.stats()
     }
 
+    /// Returns the class's normalized soft CPU entitlement in milli-cores.
+    ///
+    /// Legacy `weight(n)` configurations report `n * 1000`; classes configured
+    /// through [`SchedulerBuilder::soft_cpu_limit`] or
+    /// [`Self::set_soft_cpu_limit`] report their supplied milli-core limit.
+    /// Unregistered classes use the default legacy weight of one (1000m).
+    pub fn soft_cpu_limit_millicores(&self, class: TaskClass) -> u64 {
+        self.inner.soft_cpu_limit_millicores(class)
+    }
+
     /// Dynamically changes the weight of a class. The class's pass is realigned
     /// to the lowest pass among all classes, so historical credit/debt from the
     /// old weight does not skew the new allocation. Queued tasks are
     /// immediately re-dispatched under the new weights.
     pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
-        self.inner.set_weight(class, weight);
+        self.inner.set_config(class, ClassConfig::legacy(weight));
+    }
+
+    /// Dynamically changes a class's soft CPU limit. Like [`Self::set_weight`],
+    /// this realigns the class pass before immediately re-dispatching queued
+    /// work. The limit is a relative work-conserving entitlement, not a hard
+    /// cap; idle capacity remains borrowable.
+    pub fn set_soft_cpu_limit(&self, class: TaskClass, limit: SoftCpuLimit) {
+        self.inner.set_config(class, ClassConfig::soft(limit));
     }
 
     /// Dynamically changes the maximum number of concurrently admitted polls.
@@ -426,7 +511,11 @@ impl<F: Future> Drop for Scheduled<F> {
 /// Per-class counters in a [`SchedulerStats`] snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClassStats {
-    /// Configured relative weight.
+    /// Configured legacy relative weight.
+    ///
+    /// A value of zero is a sentinel meaning this class was configured with
+    /// the soft CPU limit API. Query [`Scheduler::soft_cpu_limit_millicores`]
+    /// for its normalized milli-core entitlement.
     pub weight: u32,
     /// Live queue entries at the time of the snapshot.
     pub queued: usize,
@@ -587,7 +676,8 @@ impl TaskControl {
                         .compare_exchange(POLLING, IDLE, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.scheduler.finish_poll(None, self.class, false, exec_time);
+                        self.scheduler
+                            .finish_poll(None, self.class, false, exec_time);
                         return;
                     }
                 }
@@ -602,7 +692,8 @@ impl TaskControl {
                         )
                         .is_ok()
                     {
-                        self.scheduler.finish_poll(Some(self), self.class, false, exec_time);
+                        self.scheduler
+                            .finish_poll(Some(self), self.class, false, exec_time);
                         return;
                     }
                 }
@@ -614,7 +705,8 @@ impl TaskControl {
     fn finish_ready(self: &Arc<Self>, exec_time: Option<Duration>) {
         let previous = self.state.swap(FINISHED, Ordering::AcqRel);
         debug_assert!(matches!(previous, POLLING | POLLING_NOTIFIED));
-        self.scheduler.finish_poll(None, self.class, true, exec_time);
+        self.scheduler
+            .finish_poll(None, self.class, true, exec_time);
     }
 
     fn cancel(self: &Arc<Self>) {
@@ -669,10 +761,9 @@ impl SchedulerInner {
             let mut state = lock(&self.state);
             let virtual_time = state.virtual_time;
             let sample_always = self.sample_every_polls <= 1;
-            let class_state = state
-                .classes
-                .entry(class)
-                .or_insert_with(|| ClassState::new(NonZeroU32::MIN, virtual_time));
+            let class_state = state.classes.entry(class).or_insert_with(|| {
+                ClassState::new(ClassConfig::legacy(NonZeroU32::MIN), virtual_time)
+            });
             class_state.stats.tasks += 1;
             (class_state.wakes.clone(), sample_always)
         };
@@ -720,10 +811,11 @@ impl SchedulerInner {
             }
             if let Some(t) = exec_time {
                 let cs = state.class_mut(class);
-                cs.pass = cs.pass.saturating_add(
-                    t.as_nanos() * TIME_SCALE
-                        / (u128::from(cs.stats.weight) * active_at_finish as u128),
-                );
+                cs.pass = cs.pass.saturating_add(pass_increment(
+                    t.as_nanos(),
+                    cs.entitlement_millicores,
+                    active_at_finish,
+                ));
                 cs.stats.total_exec_time += t;
             }
             if let Some(task) = requeue {
@@ -774,13 +866,21 @@ impl SchedulerInner {
         }
     }
 
-    fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
+    fn soft_cpu_limit_millicores(&self, class: TaskClass) -> u64 {
+        let state = lock(&self.state);
+        state
+            .classes
+            .get(&class)
+            .map_or(1_000, |class_state| class_state.entitlement_millicores)
+    }
+
+    fn set_config(&self, class: TaskClass, config: ClassConfig) {
         let wakers = {
             let mut state = lock(&self.state);
             // Align this class's pass with the lowest pass among all classes.
             // Pass scheduling only cares about relative pass values; a class
-            // that accumulated a high pass under the old weight would keep its
-            // low priority forever if we left it alone.
+            // that accumulated a high pass under the old configuration would
+            // keep its low priority forever if we left it alone.
             let min_pass = state
                 .classes
                 .values()
@@ -789,7 +889,8 @@ impl SchedulerInner {
                 .unwrap_or(state.virtual_time);
             let class_state = state.class_mut(class);
             class_state.pass = min_pass;
-            class_state.stats.weight = weight.get();
+            class_state.entitlement_millicores = config.entitlement_millicores;
+            class_state.stats.weight = config.legacy_weight;
             state.dispatch()
         };
         wake_all(wakers);
@@ -817,7 +918,7 @@ impl ScheduleState {
         let virtual_time = self.virtual_time;
         self.classes
             .entry(class)
-            .or_insert_with(|| ClassState::new(NonZeroU32::MIN, virtual_time))
+            .or_insert_with(|| ClassState::new(ClassConfig::legacy(NonZeroU32::MIN), virtual_time))
     }
 
     fn enqueue(&mut self, task: &Arc<TaskControl>) {
@@ -906,6 +1007,7 @@ impl ScheduleState {
 
 struct ClassState {
     pass: u128,
+    entitlement_millicores: u64,
     queued: usize,
     queue: VecDeque<Weak<TaskControl>>,
     wakes: Arc<AtomicU64>,
@@ -913,18 +1015,61 @@ struct ClassState {
 }
 
 impl ClassState {
-    fn new(weight: NonZeroU32, pass: u128) -> Self {
+    fn new(config: ClassConfig, pass: u128) -> Self {
         Self {
             pass,
+            entitlement_millicores: config.entitlement_millicores,
             queued: 0,
             queue: VecDeque::new(),
             wakes: Arc::new(AtomicU64::new(0)),
             stats: ClassStats {
-                weight: weight.get(),
+                weight: config.legacy_weight,
+
                 ..ClassStats::default()
             },
         }
     }
+}
+
+/// Computes `floor(elapsed * TIME_SCALE * 1000 / (entitlement * active))`.
+///
+/// The 1000 milli-core scale is first reduced against the entitlement. Thus a
+/// legacy `weight(n)` entitlement of `n * 1000m` becomes exactly the former
+/// `floor(elapsed * TIME_SCALE / (n * active))` calculation. Checked
+/// multiplication after reduction saturates to `u128::MAX`; this is only used
+/// when the mathematical numerator or denominator cannot be represented.
+fn pass_increment(
+    elapsed_nanos: u128,
+    entitlement_millicores: u64,
+    active_at_finish: usize,
+) -> u128 {
+    debug_assert!(entitlement_millicores > 0);
+    debug_assert!(active_at_finish > 0);
+
+    let gcd = gcd_u64(entitlement_millicores, 1_000);
+    let numerator_factor = u128::from(1_000 / gcd);
+    let denominator_factor = u128::from(entitlement_millicores / gcd);
+    let denominator = match denominator_factor.checked_mul(active_at_finish as u128) {
+        Some(denominator) => denominator,
+        None => return u128::MAX,
+    };
+    let numerator = match elapsed_nanos
+        .checked_mul(TIME_SCALE)
+        .and_then(|value| value.checked_mul(numerator_factor))
+    {
+        Some(numerator) => numerator,
+        None => return u128::MAX,
+    };
+    numerator / denominator
+}
+
+const fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1031,6 +1176,36 @@ mod tests {
     }
 
     #[test]
+    fn pass_increment_reduces_millicores_without_overflow_or_panics() {
+        for (elapsed, weight, active) in [
+            (1, 1, 1),
+            (1, u32::MAX, 1),
+            (17, 7, 3),
+            (u64::MAX as u128, 3, 4),
+        ] {
+            let old = elapsed
+                .checked_mul(TIME_SCALE)
+                .expect("representative old numerator fits")
+                / (u128::from(weight) * active as u128);
+            assert_eq!(
+                old,
+                pass_increment(elapsed, u64::from(weight) * 1_000, active)
+            );
+        }
+
+        // 500m reduces to a factor of 2; 1500m reduces to 2 / 3.
+        assert_eq!(2 * TIME_SCALE, pass_increment(1, 500, 1));
+        assert_eq!(2 * TIME_SCALE / 3, pass_increment(1, 1_500, 1));
+        assert_eq!(TIME_SCALE / 3, pass_increment(1, 1_500, 2));
+        assert!(pass_increment(1, u64::from(u32::MAX) * 1_000, 1) > 0);
+
+        // Extreme representable inputs deterministically saturate rather than
+        // panicking on an intermediate multiplication.
+        assert_eq!(u128::MAX, pass_increment(u128::MAX, 1, 1));
+        assert_eq!(u128::MAX, pass_increment(u128::MAX, u64::MAX, usize::MAX));
+    }
+
+    #[test]
     fn sample_every_polls_defaults_to_one() {
         let scheduler = Scheduler::builder().build();
         assert_eq!(scheduler.stats().sample_every_polls, 1);
@@ -1044,9 +1219,7 @@ mod tests {
     /// `total_exec_time` grows past zero, matching the pre-sampling behavior.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_sampling_records_exec_time() {
-        let scheduler = Scheduler::builder()
-            .max_concurrent_polls(2)
-            .build();
+        let scheduler = Scheduler::builder().max_concurrent_polls(2).build();
         assert_eq!(scheduler.stats().sample_every_polls, 1);
 
         let polls = Arc::new(AtomicU64::new(0));
@@ -1062,7 +1235,11 @@ mod tests {
         let stats = scheduler.stats();
         let class = stats.classes.get(&CLASS_A).expect("class must exist");
         assert!(class.total_exec_time > Duration::ZERO);
-        assert!(class.polls >= 11, "expected at least 11 polls, got {}", class.polls);
+        assert!(
+            class.polls >= 11,
+            "expected at least 11 polls, got {}",
+            class.polls
+        );
     }
 
     /// Downsampled sampling must not break scheduling: all tasks still

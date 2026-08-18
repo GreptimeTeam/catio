@@ -5,10 +5,50 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use catio::{Scheduler, TaskClass};
+use catio::{Scheduler, SoftCpuLimit, TaskClass};
 
 const A: TaskClass = TaskClass::new(1);
 const B: TaskClass = TaskClass::new(2);
+const C: TaskClass = TaskClass::new(3);
+
+#[test]
+fn soft_cpu_limit_validates_fixed_point_millicores() {
+    assert_eq!(None, SoftCpuLimit::from_millicores(0));
+    assert_eq!(
+        Some(500),
+        SoftCpuLimit::from_millicores(500).map(SoftCpuLimit::millicores)
+    );
+    assert_eq!(
+        Some(1_500),
+        SoftCpuLimit::from_millicores(1_500).map(SoftCpuLimit::millicores)
+    );
+    assert_eq!(
+        Some(2_000),
+        SoftCpuLimit::from_cores(2).map(SoftCpuLimit::millicores)
+    );
+    assert_eq!(None, SoftCpuLimit::from_cores(0));
+    assert_eq!(None, SoftCpuLimit::from_cores(u32::MAX / 1_000 + 1));
+    let largest_cores = u32::MAX / 1_000;
+    assert_eq!(
+        Some(largest_cores * 1_000),
+        SoftCpuLimit::from_cores(largest_cores).map(SoftCpuLimit::millicores)
+    );
+    assert_eq!(
+        Some(u32::MAX),
+        SoftCpuLimit::from_millicores(u32::MAX).map(SoftCpuLimit::millicores)
+    );
+}
+
+#[test]
+fn default_and_soft_class_entitlements_are_queryable_without_stats_breakage() {
+    let scheduler = Scheduler::builder()
+        .soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap())
+        .build();
+    assert_eq!(1_000, scheduler.soft_cpu_limit_millicores(B));
+    assert_eq!(1, scheduler.stats().classes[&TaskClass::DEFAULT].weight);
+    assert_eq!(0, scheduler.stats().classes[&A].weight);
+    assert_eq!(500, scheduler.soft_cpu_limit_millicores(A));
+}
 
 struct SaturatedWork {
     stop: Arc<AtomicBool>,
@@ -32,6 +72,37 @@ impl Future for SaturatedWork {
         cx.waker().wake_by_ref();
         Poll::Pending
     }
+}
+
+async fn wait_for_polls(polls: &[&AtomicU64], target: u64, message: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if polls
+                .iter()
+                .map(|polls| polls.load(Ordering::Relaxed))
+                .sum::<u64>()
+                >= target
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect(message);
+}
+
+#[test]
+fn dynamic_api_transitions_update_weight_sentinel_and_entitlement() {
+    let scheduler = Scheduler::builder().weight(A, 2).build();
+    assert_eq!(2, scheduler.stats().classes[&A].weight);
+    assert_eq!(2_000, scheduler.soft_cpu_limit_millicores(A));
+    scheduler.set_soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap());
+    assert_eq!(0, scheduler.stats().classes[&A].weight);
+    assert_eq!(500, scheduler.soft_cpu_limit_millicores(A));
+    scheduler.set_weight(A, std::num::NonZeroU32::new(3).unwrap());
+    assert_eq!(3, scheduler.stats().classes[&A].weight);
+    assert_eq!(3_000, scheduler.soft_cpu_limit_millicores(A));
 }
 
 #[test]
@@ -111,6 +182,153 @@ fn saturated_runtime_keeps_a_30_b_70() {
     });
 }
 
+#[test]
+fn saturated_soft_limits_keep_1_2_5_exec_time_shares() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let scheduler = Scheduler::builder()
+            .max_concurrent_polls(4)
+            .soft_cpu_limit(A, SoftCpuLimit::from_cores(1).unwrap())
+            .soft_cpu_limit(B, SoftCpuLimit::from_cores(2).unwrap())
+            .soft_cpu_limit(C, SoftCpuLimit::from_cores(5).unwrap())
+            .build();
+        let stop = Arc::new(AtomicBool::new(false));
+        let polls = [
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        ];
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            for (class, class_polls) in [
+                (A, polls[0].clone()),
+                (B, polls[1].clone()),
+                (C, polls[2].clone()),
+            ] {
+                handles.push(scheduler.spawn_in(
+                    class,
+                    SaturatedWork {
+                        stop: stop.clone(),
+                        polls: class_polls,
+                    },
+                ));
+            }
+        }
+        wait_for_polls(
+            &[&polls[0], &polls[1], &polls[2]],
+            30_000,
+            "soft-limit workload made no progress",
+        )
+        .await;
+        stop.store(true, Ordering::Release);
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let stats = scheduler.stats();
+        let exec = [
+            stats.classes[&A].total_exec_time.as_secs_f64(),
+            stats.classes[&B].total_exec_time.as_secs_f64(),
+            stats.classes[&C].total_exec_time.as_secs_f64(),
+        ];
+        let total: f64 = exec.iter().sum();
+        for (actual, expected) in exec.into_iter().zip([0.125, 0.25, 0.625]) {
+            assert!(
+                (expected - 0.02..=expected + 0.02).contains(&(actual / total)),
+                "expected {expected}, got {}",
+                actual / total
+            );
+        }
+    });
+}
+
+#[test]
+fn fractional_soft_limits_keep_25_75_exec_time_shares() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let scheduler = Scheduler::builder()
+            .max_concurrent_polls(4)
+            .soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap())
+            .soft_cpu_limit(B, SoftCpuLimit::from_millicores(1_500).unwrap())
+            .build();
+        let stop = Arc::new(AtomicBool::new(false));
+        let a = Arc::new(AtomicU64::new(0));
+        let b = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            for (class, polls) in [(A, a.clone()), (B, b.clone())] {
+                handles.push(scheduler.spawn_in(
+                    class,
+                    SaturatedWork {
+                        stop: stop.clone(),
+                        polls,
+                    },
+                ));
+            }
+        }
+        wait_for_polls(&[&a, &b], 20_000, "fractional workload made no progress").await;
+        stop.store(true, Ordering::Release);
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let stats = scheduler.stats();
+        let a_exec = stats.classes[&A].total_exec_time.as_secs_f64();
+        let b_exec = stats.classes[&B].total_exec_time.as_secs_f64();
+        assert!((0.23..=0.27).contains(&(a_exec / (a_exec + b_exec))));
+    });
+}
+
+#[test]
+fn legacy_weight_and_two_core_soft_limit_split_exec_time_evenly() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let scheduler = Scheduler::builder()
+            .max_concurrent_polls(4)
+            .weight(A, 2)
+            .soft_cpu_limit(B, SoftCpuLimit::from_cores(2).unwrap())
+            .build();
+        assert_eq!(2, scheduler.stats().classes[&A].weight);
+        assert_eq!(0, scheduler.stats().classes[&B].weight);
+        assert_eq!(2_000, scheduler.soft_cpu_limit_millicores(A));
+        assert_eq!(2_000, scheduler.soft_cpu_limit_millicores(B));
+        let stop = Arc::new(AtomicBool::new(false));
+        let a = Arc::new(AtomicU64::new(0));
+        let b = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            for (class, polls) in [(A, a.clone()), (B, b.clone())] {
+                handles.push(scheduler.spawn_in(
+                    class,
+                    SaturatedWork {
+                        stop: stop.clone(),
+                        polls,
+                    },
+                ));
+            }
+        }
+        wait_for_polls(&[&a, &b], 20_000, "mixed workload made no progress").await;
+        stop.store(true, Ordering::Release);
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let stats = scheduler.stats();
+        let a_exec = stats.classes[&A].total_exec_time.as_secs_f64();
+        let b_exec = stats.classes[&B].total_exec_time.as_secs_f64();
+        assert!((0.48..=0.52).contains(&(a_exec / (a_exec + b_exec))));
+    });
+}
+
 struct FiniteSelfWaking {
     remaining: usize,
 }
@@ -150,7 +368,10 @@ async fn idle_classes_do_not_reserve_capacity() {
 
     let stats = scheduler.stats();
     // B never ran, so it must hold no exec time; A holds all of it (~100%).
-    assert_eq!(0, stats.classes[&B].polls, "B must not be admitted while idle");
+    assert_eq!(
+        0, stats.classes[&B].polls,
+        "B must not be admitted while idle"
+    );
     assert!(
         stats.classes[&A].total_exec_time > Duration::ZERO,
         "A should have accumulated exec time"
@@ -166,8 +387,8 @@ async fn idle_classes_do_not_reserve_capacity() {
 async fn an_idle_class_rejoins_without_old_credit_or_debt() {
     let scheduler = Scheduler::builder()
         .max_concurrent_polls(4)
-        .weight(A, 2)
-        .weight(B, 8)
+        .soft_cpu_limit(A, SoftCpuLimit::from_cores(2).unwrap())
+        .soft_cpu_limit(B, SoftCpuLimit::from_cores(8).unwrap())
         .build();
 
     let first_stop = Arc::new(AtomicBool::new(false));
@@ -183,9 +404,7 @@ async fn an_idle_class_rejoins_without_old_credit_or_debt() {
             )
         })
         .collect::<Vec<_>>();
-    while first_polls.load(Ordering::Relaxed) < 10_000 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_polls(&[&first_polls], 10_000, "solo class made no progress").await;
     first_stop.store(true, Ordering::Release);
     for handle in first_handles {
         handle.await.unwrap();
@@ -220,9 +439,12 @@ async fn an_idle_class_rejoins_without_old_credit_or_debt() {
             },
         ));
     }
-    while a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed) < 30_000 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_polls(
+        &[&a_polls, &b_polls],
+        30_000,
+        "rejoined class made no progress",
+    )
+    .await;
 
     let a = a_polls.load(Ordering::Relaxed);
     let b = b_polls.load(Ordering::Relaxed);
@@ -386,9 +608,12 @@ async fn dynamic_weight_change_reallocates_share() {
     }
 
     // Let the initial 30/70 allocation run for a while.
-    while a_polls.load(Ordering::Relaxed) + b_polls.load(Ordering::Relaxed) < 20_000 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_polls(
+        &[&a_polls, &b_polls],
+        20_000,
+        "initial dynamic-weight workload made no progress",
+    )
+    .await;
     let a_before_flip = a_polls.load(Ordering::Relaxed);
     let b_before_flip = b_polls.load(Ordering::Relaxed);
     // Snapshot exec time so the post-flip assertion measures only the new
@@ -442,6 +667,66 @@ async fn dynamic_weight_change_reallocates_share() {
     assert_eq!(7, stats.classes[&A].weight);
     assert_eq!(3, stats.classes[&B].weight);
 
+    stop.store(true, Ordering::Release);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_soft_cpu_limit_change_reallocates_share_and_updates_query() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(4)
+        .soft_cpu_limit(A, SoftCpuLimit::from_cores(3).unwrap())
+        .soft_cpu_limit(B, SoftCpuLimit::from_cores(7).unwrap())
+        .build();
+    let stop = Arc::new(AtomicBool::new(false));
+    let a = Arc::new(AtomicU64::new(0));
+    let b = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        for (class, polls) in [(A, a.clone()), (B, b.clone())] {
+            handles.push(scheduler.spawn_in(
+                class,
+                SaturatedWork {
+                    stop: stop.clone(),
+                    polls,
+                },
+            ));
+        }
+    }
+    wait_for_polls(
+        &[&a, &b],
+        20_000,
+        "initial dynamic soft-limit workload made no progress",
+    )
+    .await;
+    let before = scheduler.stats();
+    let a_before = before.classes[&A].total_exec_time.as_secs_f64();
+    let b_before = before.classes[&B].total_exec_time.as_secs_f64();
+    scheduler.set_soft_cpu_limit(A, SoftCpuLimit::from_cores(7).unwrap());
+    scheduler.set_soft_cpu_limit(B, SoftCpuLimit::from_cores(3).unwrap());
+    assert_eq!(0, scheduler.stats().classes[&A].weight);
+    assert_eq!(7_000, scheduler.soft_cpu_limit_millicores(A));
+    assert_eq!(3_000, scheduler.soft_cpu_limit_millicores(B));
+    let polls_before = a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed) >= polls_before + 20_000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("updated soft-limit workload made no progress");
+    let after = scheduler.stats();
+    let a_exec = after.classes[&A].total_exec_time.as_secs_f64() - a_before;
+    let b_exec = after.classes[&B].total_exec_time.as_secs_f64() - b_before;
+    assert!(
+        a_exec / (a_exec + b_exec) >= 0.65,
+        "soft update did not reallocate exec time"
+    );
     stop.store(true, Ordering::Release);
     for handle in handles {
         handle.await.unwrap();
