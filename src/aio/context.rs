@@ -146,7 +146,7 @@ fn create_eventfd() -> Result<RawFd> {
 }
 
 /// Enum to describe AIO operations. `IO_CMD_POLL`, `IO_CMD_PREADV` and `IO_CMD_PWRITEV` are not included.
-crate enum AioOp {
+pub(crate) enum AioOp {
     /// Positioned read. Corresponds to `IO_CMD_PREAD`.
     ///
     /// Parameters are: fd to read, read buffer, offset, size.
@@ -183,7 +183,7 @@ fn issue_noop(ctx: &Context) -> Result<Task<()>> {
 }
 
 /// Wrap over the inner's raw pointer.
-crate struct Task<T: Sized> {
+pub(crate) struct Task<T: Sized> {
     inner: *mut TaskInner,
     _phantom: PhantomData<T>,
 }
@@ -226,13 +226,13 @@ impl<T: Sized> Future for Task<T> {
     }
 }
 
-crate struct TaskInner {
+pub(crate) struct TaskInner {
     // todo: this should provides two access ways for `Send` and `!Send`.
     // (atomic and normal).
     state: TaskState,
 }
 
-crate enum TaskState {
+pub(crate) enum TaskState {
     /// The task is allocated but hasn't been polled yet.
     Allocated,
     /// The task is polled.
