@@ -11,6 +11,419 @@ const A: TaskClass = TaskClass::new(1);
 const B: TaskClass = TaskClass::new(2);
 const C: TaskClass = TaskClass::new(3);
 
+struct ReentrantSpawnWaker {
+    scheduler: Scheduler,
+    called: Arc<AtomicBool>,
+}
+
+impl std::task::Wake for ReentrantSpawnWaker {
+    fn wake(self: Arc<Self>) {
+        self.called.store(true, Ordering::Release);
+        drop(self.scheduler.spawn(async {}));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_wakes_reentrantly_without_holding_switch_lock() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let noop = Waker::from(Arc::new(NoopWaker));
+    let mut blocker = Box::pin(scheduler.schedule(std::future::pending::<()>()));
+    let mut cx = Context::from_waker(&noop);
+    assert!(matches!(blocker.as_mut().poll(&mut cx), Poll::Pending));
+
+    let called = Arc::new(AtomicBool::new(false));
+    let reentrant = Waker::from(Arc::new(ReentrantSpawnWaker {
+        scheduler: scheduler.clone(),
+        called: called.clone(),
+    }));
+    let mut queued = Box::pin(scheduler.schedule(std::future::pending::<()>()));
+    let mut queued_cx = Context::from_waker(&reentrant);
+    assert!(matches!(
+        queued.as_mut().poll(&mut queued_cx),
+        Poll::Pending
+    ));
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || scheduler.set_enabled(false)),
+    )
+    .await
+    .expect("disable must not deadlock in a reentrant waker")
+    .expect("disable task must complete");
+    assert!(called.load(Ordering::Acquire));
+}
+
+struct NoopWaker;
+
+impl std::task::Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_spawns_bypass_scheduler_and_reenable_restores_admission() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    scheduler.set_enabled(false);
+    assert!(!scheduler.is_enabled());
+    let spawner = scheduler.spawner(A);
+    let direct = spawner.spawn(async { 7_u32 });
+    assert_eq!(7, direct.await.unwrap());
+    let stats = scheduler.stats();
+    assert_eq!(0, stats.classes[&TaskClass::DEFAULT].tasks);
+    assert!(!stats.classes.contains_key(&A));
+
+    scheduler.set_enabled(true);
+    assert!(scheduler.is_enabled());
+    let managed = scheduler.spawn_in(A, async {});
+    managed.await.unwrap();
+    let stats = scheduler.stats();
+    assert_eq!(1, stats.classes[&A].tasks);
+    assert_eq!(1, stats.classes[&A].admitted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_drains_queued_tasks_without_hanging() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let release = Arc::new(AtomicBool::new(false));
+    let blocker_started = Arc::new(AtomicBool::new(false));
+    let blocker = scheduler.spawn(BlockingPoll {
+        started: blocker_started.clone(),
+        release: release.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !blocker_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocker must hold the admission slot");
+    let tasks = (0..32)
+        .map(|_| scheduler.spawn(async {}))
+        .collect::<Vec<_>>();
+    // The blocker owns the only admission slot. Wait for the scheduler
+    // counters, rather than relying on a timing-sensitive executor yield, so
+    // disable is known to drain actual queued work.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = scheduler.stats();
+            if stats.active_polls == 1 && stats.classes[&TaskClass::DEFAULT].queued > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("queued work must be admitted before disable");
+    scheduler.set_enabled(false);
+    release.store(true, Ordering::Release);
+    blocker.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .expect("disabling scheduler must drain queued tasks");
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_disable_wrapper_stays_bypassed_after_immediate_reenable() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let polls = Arc::new(AtomicU64::new(0));
+    let captured = Arc::new(Mutex::new(None));
+    let old = scheduler.spawn(CaptureThenReady {
+        polls: polls.clone(),
+        captured: captured.clone(),
+    });
+    // The captured inner waker is the precise completion signal for the first poll.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while captured.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("pre-disable wrapper must become pending");
+    let admitted_before = scheduler.stats().classes[&TaskClass::DEFAULT].admitted;
+    scheduler.set_enabled(false);
+    captured.lock().unwrap().take().unwrap().wake();
+    scheduler.set_enabled(true);
+    old.await.unwrap();
+    assert_eq!(2, polls.load(Ordering::SeqCst));
+    assert_eq!(
+        admitted_before,
+        scheduler.stats().classes[&TaskClass::DEFAULT].admitted
+    );
+
+    let managed = scheduler.spawn(async {});
+    managed.await.unwrap();
+    assert_eq!(
+        admitted_before + 1,
+        scheduler.stats().classes[&TaskClass::DEFAULT].admitted,
+        "post-enable work must be scheduler-managed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bypassed_panic_does_not_release_another_tasks_admission() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let holder_release = Arc::new(AtomicBool::new(false));
+    let holder_started = Arc::new(AtomicBool::new(false));
+    let holder = scheduler.spawn(BlockingPoll {
+        started: holder_started.clone(),
+        release: holder_release.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !holder_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("holder must own the only admission slot");
+
+    // This wrapper is queued while enabled, then drained into sticky direct
+    // mode. Re-enable before Tokio gets to poll it so the panic is observed in
+    // the direct path.
+    let bypassed = scheduler.spawn(PanicOnPoll);
+    wait_for_default_queue(&scheduler, 1).await;
+    scheduler.set_enabled(false);
+    scheduler.set_enabled(true);
+
+    let waiting = scheduler.spawn(async { 9_u8 });
+    let panic_error = tokio::time::timeout(Duration::from_secs(2), bypassed)
+        .await
+        .expect("bypassed panic must be observed")
+        .expect_err("intentional direct panic must produce JoinError");
+    assert!(panic_error.is_panic());
+
+    let stats = scheduler.stats();
+    assert_eq!(1, stats.active_polls);
+    assert_eq!(1, stats.classes[&TaskClass::DEFAULT].queued);
+
+    holder_release.store(true, Ordering::Release);
+    holder.await.unwrap();
+    assert_eq!(9, waiting.await.unwrap());
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_queued_work_reclaims_no_longer_owned_admission() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let release = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let blocker = scheduler.spawn(BlockingPoll {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocker must hold the only admission slot");
+
+    let cancelled = scheduler.spawn(std::future::pending::<()>());
+    let waiting = scheduler.spawn(async { 11_u8 });
+    wait_for_default_queue(&scheduler, 2).await;
+    let before_cancel = scheduler.stats();
+    assert_eq!(1, before_cancel.active_polls);
+    assert_eq!(2, before_cancel.classes[&TaskClass::DEFAULT].queued);
+    assert!(
+        !waiting.is_finished(),
+        "waiting work completed before cancellation"
+    );
+
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+
+    let after_cancel = scheduler.stats();
+    assert_eq!(1, after_cancel.active_polls);
+    assert_eq!(1, after_cancel.classes[&TaskClass::DEFAULT].queued);
+    assert_eq!(
+        before_cancel.classes[&TaskClass::DEFAULT].admitted,
+        after_cancel.classes[&TaskClass::DEFAULT].admitted,
+        "cancelling queued work must not release the blocker's slot"
+    );
+    assert!(
+        !waiting.is_finished(),
+        "waiting work completed before blocker release"
+    );
+
+    release.store(true, Ordering::Release);
+    blocker.await.unwrap();
+    assert_eq!(
+        11,
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("queued work must proceed after cancellation")
+            .unwrap()
+    );
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_panic_releases_admission_for_queued_work() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let release = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let blocker = scheduler.spawn(BlockingPoll {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocker must hold the only admission slot");
+
+    let panicking = scheduler.spawn(ManagedPanicOnPoll);
+    let waiting = scheduler.spawn(async { 13_u8 });
+    wait_for_default_queue(&scheduler, 2).await;
+    release.store(true, Ordering::Release);
+    blocker.await.unwrap();
+
+    let panic_error = tokio::time::timeout(Duration::from_secs(2), panicking)
+        .await
+        .expect("managed panic must be observed")
+        .expect_err("intentional managed panic must produce JoinError");
+    assert!(panic_error.is_panic());
+    assert_eq!(
+        13,
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("queued work must proceed after panic")
+            .unwrap()
+    );
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_work_after_disable_reclaims_slots_for_post_enable_work() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let blocker = scheduler.spawn({
+        let release = release.clone();
+        let started = started.clone();
+        async move {
+            started.notify_one();
+            release.notified().await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("blocker must start");
+    let queued = (0..32)
+        .map(|_| {
+            scheduler.spawn(FiniteSelfWaking {
+                remaining: usize::MAX,
+            })
+        })
+        .collect::<Vec<_>>();
+    // One task may already own the sole slot, so the maximum queued backlog
+    // is one less than the number submitted. Waiting for the full submission
+    // count would make this cancellation regression impossible to observe.
+    wait_for_default_queue(&scheduler, queued.len() - 1).await;
+    scheduler.set_enabled(false);
+    release.notify_one();
+    blocker.await.unwrap();
+    for task in &queued {
+        task.abort();
+    }
+    for task in queued {
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(0, scheduler.stats().active_polls);
+
+    scheduler.set_enabled(true);
+    tokio::time::timeout(Duration::from_secs(2), scheduler.spawn(async { 9_u8 }))
+        .await
+        .expect("post-enable task must not be blocked by cancelled work")
+        .unwrap();
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_waking_poll_racing_disable_completes_without_panic() {
+    let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicU64::new(0));
+    let task = scheduler.spawn(DisableWhilePolling {
+        started: started.clone(),
+        release: release.clone(),
+        polls: polls.clone(),
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("self-waking task must enter its poll");
+    scheduler.set_enabled(false);
+    release.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("disabled self-waking task must complete")
+        .unwrap();
+    assert!(polls.load(Ordering::SeqCst) >= 2);
+    assert_eq!(0, scheduler.stats().active_polls);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_scheduler_spawn_apis_bypass_unknown_classes() {
+    let scheduler = Scheduler::builder().build();
+    let runtime = tokio::runtime::Handle::current();
+    let classes = [
+        TaskClass::new(101),
+        TaskClass::new(102),
+        TaskClass::new(103),
+        TaskClass::new(104),
+        TaskClass::new(105),
+        TaskClass::new(106),
+        TaskClass::new(107),
+    ];
+    scheduler.set_enabled(false);
+    let spawner = scheduler.spawner(classes[4]);
+    let handles = vec![
+        scheduler.spawn(async {}),
+        scheduler.spawn_in(classes[0], async {}),
+        scheduler.spawn_on(&runtime, async {}),
+        scheduler.spawn_in_on(&runtime, classes[1], async {}),
+        spawner.spawn(async {}),
+        spawner.spawn_on(&runtime, async {}),
+    ];
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let local_default = scheduler.spawn_local(async {});
+            let local_class = scheduler.spawn_local_in(classes[5], async {});
+            local_default.await.unwrap();
+            local_class.await.unwrap();
+        })
+        .await;
+    let stats = scheduler.stats();
+    assert_eq!(0, stats.classes[&TaskClass::DEFAULT].tasks);
+    for class in classes {
+        assert!(
+            !stats.classes.contains_key(&class),
+            "disabled API must not create scheduler state for class {class}"
+        );
+    }
+    assert_eq!(0, stats.classes[&TaskClass::DEFAULT].admitted);
+}
+
+#[test]
+fn zero_runtime_concurrency_is_rejected() {
+    let result = std::panic::catch_unwind(|| Scheduler::builder().max_concurrent_polls(0));
+    assert!(result.is_err());
+    let scheduler = Scheduler::default();
+    let result = std::panic::catch_unwind(|| scheduler.set_max_concurrent_polls(0));
+    assert!(result.is_err());
+}
+
 #[test]
 fn soft_cpu_limit_validates_fixed_point_millicores() {
     assert_eq!(None, SoftCpuLimit::from_millicores(0));
@@ -489,6 +902,26 @@ struct BlockingPoll {
     release: Arc<AtomicBool>,
 }
 
+struct ManagedPanicOnPoll;
+
+impl Future for ManagedPanicOnPoll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        panic!("intentional managed panic");
+    }
+}
+
+struct PanicOnPoll;
+
+impl Future for PanicOnPoll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        panic!("intentional direct-poll panic");
+    }
+}
+
 impl Future for BlockingPoll {
     type Output = ();
 
@@ -499,6 +932,43 @@ impl Future for BlockingPoll {
         }
         Poll::Ready(())
     }
+}
+
+struct DisableWhilePolling {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<AtomicBool>,
+    polls: Arc<AtomicU64>,
+}
+
+impl Future for DisableWhilePolling {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+        if poll == 0 {
+            self.started.notify_one();
+            while !self.release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+async fn wait_for_default_queue(scheduler: &Scheduler, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if scheduler.stats().classes[&TaskClass::DEFAULT].queued >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expected scheduler backlog was not observed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

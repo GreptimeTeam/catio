@@ -220,6 +220,9 @@ impl SchedulerBuilder {
                 }),
                 sample_every_polls: self.sample_every_polls,
                 poll_counters: Mutex::new(BTreeMap::new()),
+                enabled: AtomicBool::new(true),
+                switch: Mutex::new(()),
+                tasks: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -279,7 +282,12 @@ impl Scheduler {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        tokio::spawn(self.schedule(future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            tokio::spawn(future)
+        } else {
+            tokio::spawn(self.schedule(future))
+        }
     }
 
     /// Spawns a future in `class` on the current Tokio runtime.
@@ -289,7 +297,12 @@ impl Scheduler {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        tokio::spawn(self.schedule_in(class, future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            tokio::spawn(future)
+        } else {
+            tokio::spawn(self.schedule_in(class, future))
+        }
     }
 
     /// Spawns a future in the default class on a specific Tokio runtime.
@@ -298,7 +311,12 @@ impl Scheduler {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        handle.spawn(self.schedule(future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            handle.spawn(future)
+        } else {
+            handle.spawn(self.schedule(future))
+        }
     }
 
     /// Spawns a future in `class` on a specific Tokio runtime.
@@ -312,7 +330,12 @@ impl Scheduler {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        handle.spawn(self.schedule_in(class, future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            handle.spawn(future)
+        } else {
+            handle.spawn(self.schedule_in(class, future))
+        }
     }
 
     /// Spawns a non-`Send` future in the default class on the current
@@ -323,7 +346,12 @@ impl Scheduler {
         F: Future + 'static,
         F::Output: 'static,
     {
-        tokio::task::spawn_local(self.schedule(future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            tokio::task::spawn_local(future)
+        } else {
+            tokio::task::spawn_local(self.schedule(future))
+        }
     }
 
     /// Spawns a non-`Send` future in `class` on the current
@@ -334,7 +362,12 @@ impl Scheduler {
         F: Future + 'static,
         F::Output: 'static,
     {
-        tokio::task::spawn_local(self.schedule_in(class, future))
+        let _switch = lock(&self.inner.switch);
+        if !self.is_enabled() {
+            tokio::task::spawn_local(future)
+        } else {
+            tokio::task::spawn_local(self.schedule_in(class, future))
+        }
     }
 
     /// Creates a reusable Tokio-like spawner for one class.
@@ -379,8 +412,29 @@ impl Scheduler {
     /// Dynamically changes the maximum number of concurrently admitted polls.
     /// Raising it admits queued tasks immediately; lowering it stops further
     /// admissions until active polls drain below the new limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `limit` is zero, like [`SchedulerBuilder::max_concurrent_polls`].
     pub fn set_max_concurrent_polls(&self, limit: usize) {
+        assert!(limit > 0, "max_concurrent_polls must be greater than zero");
         self.inner.set_max_concurrent_polls(limit);
+    }
+
+    /// Enables or disables scheduler mediation for new spawn submissions.
+    ///
+    /// The default is enabled. Disabling is linearized by this call: queued
+    /// work is removed under the scheduler lock and its executor wakers are
+    /// called afterwards, while admitted work is released and woken likewise.
+    /// Existing [`Scheduled`] wrappers remain wrappers, but poll directly with
+    /// Tokio's waker while disabled. Re-enabling affects later submissions.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.inner.set_enabled(enabled);
+    }
+
+    /// Returns whether new spawn submissions are scheduler-managed.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.enabled.load(Ordering::Acquire)
     }
 }
 
@@ -468,24 +522,107 @@ impl<F: Future> Future for Scheduled<F> {
         // Moving Pin<Box<F>> does not move F, so Scheduled<F> is safe to access
         // through get_mut even when F itself is !Unpin.
         let this = self.get_mut();
-        this.control.register_executor_waker(cx.waker());
 
+        // A wrapper present at disable is permanently drained directly. The
+        // sticky bit is intentionally checked in addition to the global flag:
+        // a quick re-enable must not re-admit an old wrapper.
+        if this.control.bypass.load(Ordering::Acquire)
+            || !this.control.scheduler.enabled.load(Ordering::Acquire)
+        {
+            loop {
+                match this.control.state.load(Ordering::Acquire) {
+                    IDLE => {
+                        if this
+                            .control
+                            .state
+                            .compare_exchange(IDLE, POLLING, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            this.control.queued.store(false, Ordering::Release);
+                            break;
+                        }
+                    }
+                    QUEUED => {
+                        if this
+                            .control
+                            .state
+                            .compare_exchange(QUEUED, POLLING, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            this.control.queued.store(false, Ordering::Release);
+                            break;
+                        }
+                    }
+                    ADMITTED => {
+                        if this
+                            .control
+                            .state
+                            .compare_exchange(
+                                ADMITTED,
+                                POLLING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                    POLLING_NOTIFIED => {
+                        if this
+                            .control
+                            .state
+                            .compare_exchange(
+                                POLLING_NOTIFIED,
+                                POLLING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+                    POLLING => return Poll::Pending,
+                    FINISHED => return Poll::Pending,
+                    _ => unreachable!(),
+                }
+            }
+            match this.future.as_mut().poll(cx) {
+                Poll::Ready(output) => {
+                    let previous = this.control.state.swap(FINISHED, Ordering::AcqRel);
+                    this.control.scheduler.release_if_owned(&this.control);
+                    debug_assert!(matches!(previous, POLLING | POLLING_NOTIFIED));
+                    this.returned = true;
+                    return Poll::Ready(output);
+                }
+                Poll::Pending => {
+                    let previous = this.control.state.swap(IDLE, Ordering::AcqRel);
+                    this.control.queued.store(false, Ordering::Release);
+                    this.control.scheduler.release_if_owned(&this.control);
+                    if previous == POLLING_NOTIFIED {
+                        let task = this.control.clone();
+                        task.executor_waker()
+                            .expect(
+                                "scheduler invariant violated: notified task has no executor waker",
+                            )
+                            .wake();
+                    }
+                    debug_assert!(matches!(previous, POLLING | POLLING_NOTIFIED));
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        this.control.register_executor_waker(cx.waker());
         if !this.control.begin_poll() {
             return Poll::Pending;
         }
-
-        // Mark the start of the admitted poll so real execution time can be
-        // charged to this class when the poll returns. With downsampled
-        // sampling (sample_every_polls > 1) only every N-th poll in the class
-        // stamps a marker; unstamped polls yield exec_time=None and are not
-        // charged (their execution time is approximated as zero).
-        if this.control.should_sample_poll() {
-            *lock(&this.control.poll_started_at) = Some(Instant::now());
-        }
-
+        // Mark the start of the admitted poll locally. With downsampled
+        // sampling only every N-th poll in the class is charged.
+        let started = this.control.should_sample_poll().then(Instant::now);
         let proxy_waker = Waker::from(this.control.clone());
         let mut proxy_context = Context::from_waker(&proxy_waker);
-        let started = lock(&this.control.poll_started_at).take();
         match this.future.as_mut().poll(&mut proxy_context) {
             Poll::Ready(output) => {
                 this.control.finish_ready(started.map(|t| t.elapsed()));
@@ -529,16 +666,15 @@ pub struct ClassStats {
     pub completed: u64,
     /// Futures dropped or aborted before returning.
     pub cancelled: u64,
-    /// Cumulative wall time from task creation (scheduler entry) to the task's
-    /// first admission (QUEUED -> ADMITTED). This is the scheduler's own
-    /// admission-queue delay, excluding Tokio's local/remote queue and any
-    /// poll execution time.
+    /// Cumulative wall time spent waiting in the scheduler queue before each
+    /// admission (QUEUED -> ADMITTED), excluding Tokio's local/remote queue
+    /// and poll execution time.
     pub total_admission_wait: Duration,
     /// Cumulative real execution time this class's futures spent inside
     /// admitted polls (poll start -> poll return). Aborted or cancelled polls
     /// are deliberately not charged.
     pub total_exec_time: Duration,
-    /// Tasks that have been admitted at least once.
+    /// Number of poll admissions (one increment per QUEUED -> ADMITTED).
     pub admitted: u64,
 }
 
@@ -561,6 +697,9 @@ struct TaskControl {
     class: TaskClass,
     state: AtomicU8,
     queued: AtomicBool,
+    // Tasks present at a disable transition permanently bypass scheduler
+    // admission, even if they are repolled after a quick re-enable.
+    bypass: AtomicBool,
     wake_counter: Arc<AtomicU64>,
     // Per-class poll counter backing downsampled clock sampling. Every task of
     // a class shares the same Arc, so each poll bumps it with a lock-free
@@ -569,10 +708,13 @@ struct TaskControl {
     executor_waker: Mutex<Option<Waker>>,
     created: Instant,
     queued_at: Mutex<Option<Instant>>,
-    poll_started_at: Mutex<Option<Instant>>,
     // Hot-path cache of `sample_every_polls <= 1`: when the scheduler samples
     // every poll, stamping needs no lock on the scheduler state.
     sample_always: bool,
+    // Whether this task currently owns a real scheduler admission slot.
+    // This is deliberately independent from `state`: bypassed tasks can use
+    // the same polling states without owning a slot.
+    admission_owned: AtomicBool,
 }
 
 impl TaskControl {
@@ -590,7 +732,7 @@ impl TaskControl {
         lock(&self.executor_waker).clone()
     }
 
-    /// Decides whether this poll should stamp `poll_started_at`.
+    /// Decides whether this poll should sample execution time.
     ///
     /// With the default every-poll sampling this is a plain field read. With
     /// downsampling it bumps the class poll counter with a single lock-free
@@ -677,24 +819,43 @@ impl TaskControl {
                         .compare_exchange(POLLING, IDLE, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.scheduler
-                            .finish_poll(None, self.class, false, exec_time);
+                        if self.bypass.load(Ordering::Acquire) {
+                            self.scheduler.release_if_owned(self);
+                        } else {
+                            self.scheduler
+                                .finish_poll(self, None, self.class, false, exec_time);
+                        }
                         return;
                     }
                 }
                 POLLING_NOTIFIED => {
+                    let owned = self.admission_owned.load(Ordering::Acquire);
                     if self
                         .state
                         .compare_exchange(
                             POLLING_NOTIFIED,
-                            QUEUED,
+                            if owned { QUEUED } else { IDLE },
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
-                        self.scheduler
-                            .finish_poll(Some(self), self.class, false, exec_time);
+                        if self.bypass.load(Ordering::Acquire) {
+                            self.scheduler.release_if_owned(self);
+                        } else {
+                            self.scheduler.finish_poll(
+                                self,
+                                Some(self),
+                                self.class,
+                                false,
+                                exec_time,
+                            );
+                        }
+                        self.executor_waker()
+                            .expect(
+                                "scheduler invariant violated: notified task has no executor waker",
+                            )
+                            .wake();
                         return;
                     }
                 }
@@ -706,22 +867,19 @@ impl TaskControl {
     fn finish_ready(self: &Arc<Self>, exec_time: Option<Duration>) {
         let previous = self.state.swap(FINISHED, Ordering::AcqRel);
         debug_assert!(matches!(previous, POLLING | POLLING_NOTIFIED));
-        self.scheduler
-            .finish_poll(None, self.class, true, exec_time);
+        if self.bypass.load(Ordering::Acquire) {
+            self.scheduler.release_if_owned(self);
+        } else {
+            self.scheduler
+                .finish_poll(self, None, self.class, true, exec_time);
+        }
     }
 
     fn cancel(self: &Arc<Self>) {
-        let previous = self.state.swap(FINISHED, Ordering::AcqRel);
-        if previous == FINISHED {
-            return;
-        }
-
-        // An aborted poll must not charge exec time: drop the start marker
-        // without recording. This asymmetry with poll accounting is deliberate.
-        let _poll_started_at = lock(&self.poll_started_at).take();
-
-        let held_admission = matches!(previous, ADMITTED | POLLING | POLLING_NOTIFIED);
-        self.scheduler.cancel(self, held_admission);
+        // Cancellation and admission assignment are linearized by the
+        // scheduler state lock; otherwise dispatch could publish ADMITTED and
+        // increment active after cancellation consumed false ownership.
+        self.scheduler.cancel(self);
     }
 }
 
@@ -744,6 +902,11 @@ struct SchedulerInner {
     // changes only when a class first appears (task creation, under the map
     // lock); each task caches its class's Arc and bumps it lock-free.
     poll_counters: Mutex<BTreeMap<TaskClass, Arc<AtomicU64>>>,
+    enabled: AtomicBool,
+    // Serializes spawn's enabled check with set_enabled's drain. `schedule_in`
+    // intentionally does not use this lock: it always returns a managed wrapper.
+    switch: Mutex<()>,
+    tasks: Mutex<Vec<Weak<TaskControl>>>,
 }
 
 impl SchedulerInner {
@@ -758,43 +921,64 @@ impl SchedulerInner {
                 .or_insert_with(|| Arc::new(AtomicU64::new(0)))
                 .clone()
         };
-        let (wake_counter, sample_always) = {
-            let mut state = lock(&self.state);
-            let virtual_time = state.virtual_time;
-            let sample_always = self.sample_every_polls <= 1;
-            let class_state = state.classes.entry(class).or_insert_with(|| {
-                ClassState::new(ClassConfig::legacy(NonZeroU32::MIN), virtual_time)
-            });
-            class_state.stats.tasks += 1;
-            (class_state.wakes.clone(), sample_always)
-        };
-
-        Arc::new(TaskControl {
+        // Hold state while registering the task. This closes the race where
+        // disable clears the registry between task creation and registration.
+        let mut state = lock(&self.state);
+        let virtual_time = state.virtual_time;
+        let sample_always = self.sample_every_polls <= 1;
+        let class_state = state
+            .classes
+            .entry(class)
+            .or_insert_with(|| ClassState::new(ClassConfig::legacy(NonZeroU32::MIN), virtual_time));
+        class_state.stats.tasks += 1;
+        let wake_counter = class_state.wakes.clone();
+        let bypass = !self.enabled.load(Ordering::Acquire);
+        let task = Arc::new(TaskControl {
             scheduler: self.clone(),
             class,
             state: AtomicU8::new(IDLE),
             queued: AtomicBool::new(false),
+            bypass: AtomicBool::new(bypass),
             wake_counter,
             poll_counter,
             executor_waker: Mutex::new(None),
             created: Instant::now(),
             queued_at: Mutex::new(None),
-            poll_started_at: Mutex::new(None),
             sample_always,
-        })
+            admission_owned: AtomicBool::new(false),
+        });
+        let mut tasks = lock(&self.tasks);
+        // Keep the drain list bounded while retaining every live task needed
+        // by a future disable transition.
+        tasks.retain(|weak| weak.upgrade().is_some());
+        tasks.push(Arc::downgrade(&task));
+        drop(tasks);
+        drop(state);
+        task
     }
 
     fn enqueue(&self, task: &Arc<TaskControl>) {
         let wakers = {
             let mut state = lock(&self.state);
-            state.enqueue(task);
-            state.dispatch()
+            if task.bypass.load(Ordering::Acquire) || !self.enabled.load(Ordering::Acquire) {
+                let _ =
+                    task.state
+                        .compare_exchange(QUEUED, IDLE, Ordering::AcqRel, Ordering::Acquire);
+                task.queued.store(false, Ordering::Release);
+                let mut batch = WakeBatch::default();
+                batch.push(task.clone());
+                batch
+            } else {
+                state.enqueue(task);
+                state.dispatch()
+            }
         };
         wake_all(wakers);
     }
 
     fn finish_poll(
         &self,
+        task: &TaskControl,
         requeue: Option<&Arc<TaskControl>>,
         class: TaskClass,
         completed: bool,
@@ -802,46 +986,121 @@ impl SchedulerInner {
     ) {
         let wakers = {
             let mut state = lock(&self.state);
-            // Read the concurrency before releasing this poll's slot: the exec
-            // time it charged was spent sharing the machine with `active`
-            // concurrent polls, so the pass increment is divided accordingly.
-            let active_at_finish = state.active.max(1);
-            state.active = state.active.saturating_sub(1);
-            if completed {
-                state.class_mut(class).stats.completed += 1;
+            assert!(
+                task.admission_owned.swap(false, Ordering::AcqRel),
+                "managed poll finished without owning an admission"
+            );
+            // Read concurrency before releasing this poll's slot: the
+            // charged execution shared the machine with `active` polls.
+            let active_at_finish = state.active;
+            state.active = state
+                .active
+                .checked_sub(1)
+                .expect("managed poll finished without an active admission");
+            if !self.enabled.load(Ordering::Acquire) {
+                if let Some(task) = requeue {
+                    // A notification racing disable can leave a queued state;
+                    // hand it directly back to Tokio.
+                    let previous = task.state.swap(IDLE, Ordering::AcqRel);
+                    debug_assert!(matches!(previous, IDLE | QUEUED | POLLING_NOTIFIED));
+                    task.queued.store(false, Ordering::Release);
+                    if previous == IDLE {
+                        // set_enabled(false) already handed this task back to
+                        // Tokio while we were finishing the poll.
+                        WakeBatch::default()
+                    } else {
+                        let mut batch = WakeBatch::default();
+                        batch.push(task.clone());
+                        batch
+                    }
+                } else {
+                    WakeBatch::default()
+                }
+            } else {
+                if completed {
+                    state.class_mut(class).stats.completed += 1;
+                }
+                if let Some(t) = exec_time {
+                    let cs = state.class_mut(class);
+                    cs.pass = cs
+                        .pass
+                        .checked_add(pass_increment(
+                            t.as_nanos(),
+                            cs.entitlement_millicores,
+                            active_at_finish,
+                        ))
+                        .expect("virtual pass overflow while accounting execution");
+                    cs.stats.total_exec_time += t;
+                }
+                if let Some(task) = requeue {
+                    state.enqueue(task);
+                }
+                state.dispatch()
             }
-            if let Some(t) = exec_time {
-                let cs = state.class_mut(class);
-                cs.pass = cs.pass.saturating_add(pass_increment(
-                    t.as_nanos(),
-                    cs.entitlement_millicores,
-                    active_at_finish,
-                ));
-                cs.stats.total_exec_time += t;
-            }
-            if let Some(task) = requeue {
-                state.enqueue(task);
-            }
-            state.dispatch()
         };
         wake_all(wakers);
     }
 
-    fn cancel(&self, task: &TaskControl, held_admission: bool) {
+    fn release_if_owned(&self, task: &TaskControl) {
         let wakers = {
             let mut state = lock(&self.state);
-            let class = state.class_mut(task.class);
-            class.stats.cancelled += 1;
+            if task.admission_owned.swap(false, Ordering::AcqRel) {
+                state.active = state
+                    .active
+                    .checked_sub(1)
+                    .expect("admission ownership exists without an active slot");
+                if self.enabled.load(Ordering::Acquire) {
+                    state.dispatch()
+                } else {
+                    WakeBatch::default()
+                }
+            } else {
+                WakeBatch::default()
+            }
+        };
+        wake_all(wakers);
+    }
+
+    fn cancel(&self, task: &TaskControl) {
+        let wakers = {
+            let mut state = lock(&self.state);
+            if task.state.swap(FINISHED, Ordering::AcqRel) == FINISHED {
+                return;
+            }
+            let enabled = self.enabled.load(Ordering::Acquire);
+            if enabled {
+                state.class_mut(task.class).stats.cancelled += 1;
+            }
             if task.queued.swap(false, Ordering::AcqRel) {
-                class.queued = class.queued.saturating_sub(1);
+                let class = state
+                    .classes
+                    .get_mut(&task.class)
+                    .expect("cancelled task class must exist");
+                class.queued = class
+                    .queued
+                    .checked_sub(1)
+                    .expect("cancelled task missing queued class entry");
                 if class.queued == 0 {
-                    class.queue.clear();
+                    for queued in class.queue.drain(..) {
+                        if let Some(queued) = queued.upgrade() {
+                            queued.queued.store(false, Ordering::Release);
+                        }
+                    }
                 }
             }
-            if held_admission {
-                state.active = state.active.saturating_sub(1);
+            // Cancellation ownership consumption is serialized by this
+            // scheduler-state lock with admission assignment.
+            if task.admission_owned.swap(false, Ordering::AcqRel) {
+                state.active = state
+                    .active
+                    .checked_sub(1)
+                    .expect("cancelled admission ownership has no active slot");
             }
-            state.dispatch()
+            if enabled {
+                state.dispatch()
+            } else {
+                WakeBatch::default()
+            }
         };
         wake_all(wakers);
     }
@@ -898,10 +1157,65 @@ impl SchedulerInner {
     }
 
     fn set_max_concurrent_polls(&self, limit: usize) {
+        assert!(limit > 0, "max_concurrent_polls must be greater than zero");
         let wakers = {
             let mut state = lock(&self.state);
             state.max_concurrent_polls = limit;
             state.dispatch()
+        };
+        wake_all(wakers);
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        // Linearize the enabled change and drain with spawn checks, but do not
+        // hold the non-reentrant switch mutex while invoking executor wakers.
+        let wakers = {
+            let _switch = lock(&self.switch);
+            self.enabled.store(enabled, Ordering::Release);
+            if enabled {
+                return;
+            }
+            let mut state = lock(&self.state);
+            let mut batch = WakeBatch::default();
+            for class in state.classes.values_mut() {
+                class.queued = 0;
+                class.queue.clear();
+            }
+            let mut tasks = lock(&self.tasks);
+            tasks.retain(|weak| weak.upgrade().is_some());
+            for weak in tasks.iter() {
+                if let Some(task) = weak.upgrade() {
+                    // This is the per-task drain generation: re-enabling the
+                    // scheduler must not re-admit this wrapper. Clear the
+                    // queue marker even for states that are not QUEUED: the
+                    // class queues were drained above, so no cancellation may
+                    // later account this task against the drained count.
+                    task.bypass.store(true, Ordering::Release);
+                    task.queued.store(false, Ordering::Release);
+                    if task
+                        .state
+                        .compare_exchange(QUEUED, IDLE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        task.queued.store(false, Ordering::Release);
+                        batch.push(task.clone());
+                    } else if task
+                        .state
+                        .compare_exchange(ADMITTED, IDLE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        if task.admission_owned.swap(false, Ordering::AcqRel) {
+                            state.active = state
+                                .active
+                                .checked_sub(1)
+                                .expect("drained admission ownership has no active slot");
+                        }
+                        batch.push(task.clone());
+                    }
+                }
+            }
+            state.dispatch();
+            batch
         };
         wake_all(wakers);
     }
@@ -943,12 +1257,9 @@ impl ScheduleState {
             let Some((class, task)) = self.next_queued() else {
                 break;
             };
-            let Some(waker) = task.executor_waker() else {
-                let _ =
-                    task.state
-                        .compare_exchange(QUEUED, IDLE, Ordering::AcqRel, Ordering::Acquire);
-                continue;
-            };
+            // The executor waker is deliberately not touched while the state
+            // mutex is held. WakeBatch retains the task and retrieves it later.
+
             if task
                 .state
                 .compare_exchange(QUEUED, ADMITTED, Ordering::AcqRel, Ordering::Acquire)
@@ -956,6 +1267,16 @@ impl ScheduleState {
             {
                 continue;
             }
+            // State alone is not admission ownership: bypassed direct polls
+            // use the same POLLING states without consuming a slot. Both
+            // ownership publication and active accounting are serialized by
+            // the scheduler state lock with cancellation consumption.
+            assert!(
+                task.admission_owned
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+                "admission assigned to a task that already owns a slot"
+            );
 
             let class_state = self
                 .classes
@@ -973,8 +1294,11 @@ impl ScheduleState {
                 .map_or_else(|| task.created.elapsed(), |queued_at| queued_at.elapsed());
             class_state.stats.total_admission_wait += wait;
             self.virtual_time = self.virtual_time.max(selected_pass);
-            self.active += 1;
-            wakers.push(waker);
+            self.active = self
+                .active
+                .checked_add(1)
+                .expect("active poll count overflow during admission");
+            wakers.push(task);
         }
         wakers
     }
@@ -989,6 +1313,8 @@ impl ScheduleState {
                 .map(|(class, _)| *class)?;
             let queued = self.classes.get_mut(&class)?.queue.pop_front()?;
             let Some(task) = queued.upgrade() else {
+                // A dead task has already consumed its queued count in
+                // cancellation; its weak queue entry is only stale storage.
                 continue;
             };
             if task.queued.swap(false, Ordering::AcqRel) {
@@ -996,9 +1322,16 @@ impl ScheduleState {
                     .classes
                     .get_mut(&class)
                     .expect("queued class must exist");
-                class_state.queued = class_state.queued.saturating_sub(1);
+                class_state.queued = class_state
+                    .queued
+                    .checked_sub(1)
+                    .expect("queue entry missing queued class count");
                 if class_state.queued == 0 {
-                    class_state.queue.clear();
+                    for queued in class_state.queue.drain(..) {
+                        if let Some(queued) = queued.upgrade() {
+                            queued.queued.store(false, Ordering::Release);
+                        }
+                    }
                 }
                 return Some((class, task));
             }
@@ -1037,8 +1370,8 @@ impl ClassState {
 /// The 1000 milli-core scale is first reduced against the entitlement. Thus a
 /// legacy `weight(n)` entitlement of `n * 1000m` becomes exactly the former
 /// `floor(elapsed * TIME_SCALE / (n * active))` calculation. Checked
-/// multiplication after reduction saturates to `u128::MAX`; this is only used
-/// when the mathematical numerator or denominator cannot be represented.
+/// multiplication after reduction is checked and fails fast if an input cannot
+/// be represented by the virtual-time arithmetic.
 fn pass_increment(
     elapsed_nanos: u128,
     entitlement_millicores: u64,
@@ -1050,17 +1383,13 @@ fn pass_increment(
     let gcd = gcd_u64(entitlement_millicores, 1_000);
     let numerator_factor = u128::from(1_000 / gcd);
     let denominator_factor = u128::from(entitlement_millicores / gcd);
-    let denominator = match denominator_factor.checked_mul(active_at_finish as u128) {
-        Some(denominator) => denominator,
-        None => return u128::MAX,
-    };
-    let numerator = match elapsed_nanos
+    let denominator = denominator_factor
+        .checked_mul(active_at_finish as u128)
+        .expect("virtual pass denominator overflow while calculating increment");
+    let numerator = elapsed_nanos
         .checked_mul(TIME_SCALE)
         .and_then(|value| value.checked_mul(numerator_factor))
-    {
-        Some(numerator) => numerator,
-        None => return u128::MAX,
-    };
+        .expect("virtual pass numerator overflow while calculating increment");
     numerator / denominator
 }
 
@@ -1081,25 +1410,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Default)]
 struct WakeBatch {
-    first: Option<Waker>,
-    rest: Vec<Waker>,
+    // Keep task references while scheduler state is locked. The executor
+    // wakers are user objects: even cloning one can invoke its raw-waker
+    // vtable, so they are retrieved only after the state lock is released.
+    tasks: Vec<Arc<TaskControl>>,
 }
 
 impl WakeBatch {
-    fn push(&mut self, waker: Waker) {
-        if self.first.is_none() {
-            self.first = Some(waker);
-        } else {
-            self.rest.push(waker);
-        }
+    fn push(&mut self, task: Arc<TaskControl>) {
+        self.tasks.push(task);
     }
 
     fn wake(self) {
-        if let Some(waker) = self.first {
-            waker.wake();
-        }
-        for waker in self.rest {
-            waker.wake();
+        for task in self.tasks {
+            task.executor_waker()
+                .expect("scheduler invariant violated: task needing wake has no executor waker")
+                .wake();
         }
     }
 }
@@ -1176,6 +1502,59 @@ mod tests {
         }
     }
 
+    struct ReadyForDirectPoll;
+
+    impl Future for ReadyForDirectPoll {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(())
+        }
+    }
+
+    struct ReentrantTestWaker;
+
+    impl Wake for ReentrantTestWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn stale_bypassed_enqueue_drains_without_admission() {
+        let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+        let task = scheduler.inner.new_task(TaskClass::DEFAULT);
+        let waker = Waker::from(Arc::new(ReentrantTestWaker));
+        task.register_executor_waker(&waker);
+
+        // This is the state of an old managed wrapper after its initial normal
+        // path decision, once disable -> enable has marked it permanently
+        // bypassed but before that old enqueue call reaches the state lock.
+        task.state.store(QUEUED, Ordering::Release);
+        task.bypass.store(true, Ordering::Release);
+        scheduler.inner.enqueue(&task);
+
+        assert_eq!(IDLE, task.state.load(Ordering::Acquire));
+        assert!(!task.queued.load(Ordering::Acquire));
+        assert_eq!(0, scheduler.stats().active_polls);
+        assert_eq!(0, scheduler.stats().classes[&TaskClass::DEFAULT].queued);
+    }
+
+    #[test]
+    fn direct_poll_of_admitted_task_releases_slot_once() {
+        let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+        let task = scheduler.inner.new_task(TaskClass::DEFAULT);
+        task.bypass.store(true, Ordering::Release);
+        task.state.store(ADMITTED, Ordering::Release);
+        task.admission_owned.store(true, Ordering::Release);
+        lock(&scheduler.inner.state).active = 1;
+
+        let mut scheduled = Box::pin(Scheduled::new(task.clone(), ReadyForDirectPoll));
+        let waker = Waker::from(Arc::new(ReentrantTestWaker));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(scheduled.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(0, scheduler.stats().active_polls);
+        assert_eq!(FINISHED, task.state.load(Ordering::Acquire));
+    }
+
     #[test]
     fn pass_increment_reduces_millicores_without_overflow_or_panics() {
         for (elapsed, weight, active) in [
@@ -1200,10 +1579,11 @@ mod tests {
         assert_eq!(TIME_SCALE / 3, pass_increment(1, 1_500, 2));
         assert!(pass_increment(1, u64::from(u32::MAX) * 1_000, 1) > 0);
 
-        // Extreme representable inputs deterministically saturate rather than
-        // panicking on an intermediate multiplication.
-        assert_eq!(u128::MAX, pass_increment(u128::MAX, 1, 1));
-        assert_eq!(u128::MAX, pass_increment(u128::MAX, u64::MAX, usize::MAX));
+        // A representable numerator retains the weighted-scheduling math.
+        assert_eq!(
+            (u128::MAX / TIME_SCALE) * TIME_SCALE,
+            pass_increment(u128::MAX / TIME_SCALE, 1_000, 1)
+        );
     }
 
     #[test]
