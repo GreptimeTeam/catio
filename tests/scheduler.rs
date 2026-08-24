@@ -1049,6 +1049,78 @@ async fn aborting_queued_tasks_reclaims_scheduler_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_config_ignores_idle_class_when_realigning_pass() {
+    let scheduler = Scheduler::builder()
+        .max_concurrent_polls(1)
+        .weight(A, 1)
+        .weight(B, 1)
+        .build();
+    let stop = Arc::new(AtomicBool::new(false));
+    let a_polls = Arc::new(AtomicU64::new(0));
+    let b_polls = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        handles.push(scheduler.spawn_in(
+            A,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: a_polls.clone(),
+            },
+        ));
+        handles.push(scheduler.spawn_in(
+            B,
+            SaturatedWork {
+                stop: stop.clone(),
+                polls: b_polls.clone(),
+            },
+        ));
+    }
+
+    // Build up real pass values while both classes remain backlogged. The
+    // assertion below uses admission counts, not elapsed-time ratios.
+    wait_for_polls(
+        &[&a_polls, &b_polls],
+        2_000,
+        "dynamic-config workload made no progress",
+    )
+    .await;
+    let before = scheduler.stats();
+    assert!(before.classes[&A].queued > 0);
+    assert!(before.classes[&B].queued > 0);
+    // This is a no-op configuration update. An idle DEFAULT class must not
+    // make A look newly entitled and let it consume the next long run.
+    scheduler.set_weight(A, std::num::NonZeroU32::new(1).unwrap());
+    // Capture admission baselines after the update so every observed delta is
+    // necessarily from post-update admissions.
+    let after_update = scheduler.stats();
+    let a_admitted_before = after_update.classes[&A].admitted;
+    let b_admitted_before = after_update.classes[&B].admitted;
+
+    let (_, b_delta) = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = scheduler.stats();
+            let a_delta = stats.classes[&A].admitted - a_admitted_before;
+            let b_delta = stats.classes[&B].admitted - b_admitted_before;
+            if a_delta + b_delta >= 20 {
+                break (a_delta, b_delta);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admissions must continue after dynamic configuration");
+    assert!(
+        b_delta > 0,
+        "backlogged B received no bounded-progress admission after A reconfiguration"
+    );
+
+    stop.store(true, Ordering::Release);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_weight_change_reallocates_share() {
     let scheduler = Scheduler::builder()
         .max_concurrent_polls(4)

@@ -394,17 +394,20 @@ impl Scheduler {
     }
 
     /// Dynamically changes the weight of a class. The class's pass is realigned
-    /// to the lowest pass among all classes, so historical credit/debt from the
-    /// old weight does not skew the new allocation. Queued tasks are
-    /// immediately re-dispatched under the new weights.
+    /// to the lowest pass among currently backlogged (queued) classes, falling
+    /// back to scheduler virtual time when none are backlogged, so historical
+    /// credit/debt from the old weight does not skew the new allocation.
+    /// Queued tasks are immediately re-dispatched under the new weights.
     pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
         self.inner.set_config(class, ClassConfig::legacy(weight));
     }
 
     /// Dynamically changes a class's soft CPU limit. Like [`Self::set_weight`],
-    /// this realigns the class pass before immediately re-dispatching queued
-    /// work. The limit is a relative work-conserving entitlement, not a hard
-    /// cap; idle capacity remains borrowable.
+    /// this realigns the class pass to the lowest pass among currently
+    /// backlogged (queued) classes, falling back to scheduler virtual time
+    /// when none are backlogged, before immediately re-dispatching queued work.
+    /// The limit is a relative work-conserving entitlement, not a hard cap;
+    /// idle capacity remains borrowable.
     pub fn set_soft_cpu_limit(&self, class: TaskClass, limit: SoftCpuLimit) {
         self.inner.set_config(class, ClassConfig::soft(limit));
     }
@@ -529,6 +532,10 @@ impl<F: Future> Future for Scheduled<F> {
         if this.control.bypass.load(Ordering::Acquire)
             || !this.control.scheduler.enabled.load(Ordering::Acquire)
         {
+            // Refresh before the state transitions below: a direct poll may
+            // wake a POLLING_NOTIFIED task, and it must wake its current Tokio
+            // host rather than an executor that previously hosted the wrapper.
+            this.control.register_executor_waker(cx.waker());
             loop {
                 match this.control.state.load(Ordering::Acquire) {
                     IDLE => {
@@ -903,8 +910,11 @@ struct SchedulerInner {
     // lock); each task caches its class's Arc and bumps it lock-free.
     poll_counters: Mutex<BTreeMap<TaskClass, Arc<AtomicU64>>>,
     enabled: AtomicBool,
-    // Serializes spawn's enabled check with set_enabled's drain. `schedule_in`
-    // intentionally does not use this lock: it always returns a managed wrapper.
+    // Serializes spawn's enabled check with set_enabled's drain. This strict
+    // linearization ensures a submission observing disable takes the raw
+    // Tokio spawn path without wrapper/control allocation; `schedule_in`
+    // intentionally does not use this lock because it always returns a
+    // managed wrapper.
     switch: Mutex<()>,
     tasks: Mutex<Vec<Weak<TaskControl>>>,
 }
@@ -1137,13 +1147,16 @@ impl SchedulerInner {
     fn set_config(&self, class: TaskClass, config: ClassConfig) {
         let wakers = {
             let mut state = lock(&self.state);
-            // Align this class's pass with the lowest pass among all classes.
-            // Pass scheduling only cares about relative pass values; a class
-            // that accumulated a high pass under the old configuration would
-            // keep its low priority forever if we left it alone.
+            // Align this class's pass with the lowest pass among currently
+            // backlogged (queued) classes, falling back to scheduler virtual
+            // time when none are backlogged. Pass scheduling only cares about
+            // relative pass values; a class that accumulated a high pass under
+            // the old configuration would keep its low priority forever if we
+            // left it alone.
             let min_pass = state
                 .classes
                 .values()
+                .filter(|c| c.queued > 0)
                 .map(|c| c.pass)
                 .min()
                 .unwrap_or(state.virtual_time);
@@ -1214,7 +1227,8 @@ impl SchedulerInner {
                     }
                 }
             }
-            state.dispatch();
+            // Queues were cleared above, so dispatch cannot admit anything;
+            // there is no wake batch to merge or discard here.
             batch
         };
         wake_all(wakers);
@@ -1512,6 +1526,24 @@ mod tests {
         }
     }
 
+    struct PendingForDirectPoll;
+
+    impl Future for PendingForDirectPoll {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    struct CountingTestWaker(Arc<AtomicU64>);
+
+    impl Wake for CountingTestWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     struct ReentrantTestWaker;
 
     impl Wake for ReentrantTestWaker {
@@ -1536,6 +1568,28 @@ mod tests {
         assert!(!task.queued.load(Ordering::Acquire));
         assert_eq!(0, scheduler.stats().active_polls);
         assert_eq!(0, scheduler.stats().classes[&TaskClass::DEFAULT].queued);
+    }
+
+    #[test]
+    fn direct_poll_refreshes_waker_before_notified_path() {
+        let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
+        let task = scheduler.inner.new_task(TaskClass::DEFAULT);
+        let old_wakes = Arc::new(AtomicU64::new(0));
+        let old_waker = Waker::from(Arc::new(CountingTestWaker(old_wakes.clone())));
+        task.register_executor_waker(&old_waker);
+        task.bypass.store(true, Ordering::Release);
+        task.state.store(POLLING_NOTIFIED, Ordering::Release);
+        let new_wakes = Arc::new(AtomicU64::new(0));
+        let new_waker = Waker::from(Arc::new(CountingTestWaker(new_wakes.clone())));
+        let mut cx = Context::from_waker(&new_waker);
+        let mut scheduled = Box::pin(Scheduled::new(task.clone(), PendingForDirectPoll));
+
+        assert!(matches!(scheduled.as_mut().poll(&mut cx), Poll::Pending));
+        task.executor_waker()
+            .expect("direct path must retain an executor waker")
+            .wake();
+        assert_eq!(0, old_wakes.load(Ordering::SeqCst));
+        assert_eq!(1, new_wakes.load(Ordering::SeqCst));
     }
 
     #[test]
