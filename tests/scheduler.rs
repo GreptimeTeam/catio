@@ -168,6 +168,7 @@ async fn bypassed_panic_does_not_release_another_tasks_admission() {
     let scheduler = Scheduler::builder().max_concurrent_polls(1).build();
     let holder_release = Arc::new(AtomicBool::new(false));
     let holder_started = Arc::new(AtomicBool::new(false));
+    let _holder_release_guard = ReleaseOnDrop(holder_release.clone());
     let holder = scheduler.spawn(BlockingPoll {
         started: holder_started.clone(),
         release: holder_release.clone(),
@@ -189,6 +190,7 @@ async fn bypassed_panic_does_not_release_another_tasks_admission() {
     scheduler.set_enabled(true);
 
     let waiting = scheduler.spawn(async { 9_u8 });
+    wait_for_default_queue(&scheduler, 1).await;
     let panic_error = tokio::time::timeout(Duration::from_secs(2), bypassed)
         .await
         .expect("bypassed panic must be observed")
@@ -200,8 +202,17 @@ async fn bypassed_panic_does_not_release_another_tasks_admission() {
     assert_eq!(1, stats.classes[&TaskClass::DEFAULT].queued);
 
     holder_release.store(true, Ordering::Release);
-    holder.await.unwrap();
-    assert_eq!(9, waiting.await.unwrap());
+    tokio::time::timeout(Duration::from_secs(2), holder)
+        .await
+        .expect("holder must finish after release")
+        .unwrap();
+    assert_eq!(
+        9,
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("waiting task must finish after holder release")
+            .unwrap()
+    );
     assert_eq!(0, scheduler.stats().active_polls);
 }
 
@@ -900,6 +911,14 @@ impl Future for CaptureThenReady {
 struct BlockingPoll {
     started: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
+}
+
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 struct ManagedPanicOnPoll;
