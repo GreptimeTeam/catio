@@ -67,9 +67,10 @@ without yielding.
 `Scheduler::builder` constructs an explicit scheduler. Its legacy `weight`
 method remains available; `soft_cpu_limit` accepts positive fixed-point
 milli-core entitlements. `weight(class, n)` corresponds to `n * 1000`
-milli-cores for share calculations. Use `spawn_in` for a one-off class, or
-create a class-specific `spawner` for repeated task creation. Use
-`schedule_in` to apply a class without creating another task, for example at
+milli-cores for share calculations. `Scheduler::set_weights` atomically updates
+listed legacy weights; omitted classes remain unchanged. Use `spawn_in` for a
+one-off class, or create a class-specific `spawner` for repeated task creation.
+Use `schedule_in` to apply a class without creating another task, for example at
 an existing request boundary:
 
 ```rust

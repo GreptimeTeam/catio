@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use catio::{Scheduler, SoftCpuLimit, TaskClass};
 
@@ -514,19 +515,6 @@ async fn wait_for_polls(polls: &[&AtomicU64], target: u64, message: &str) {
     })
     .await
     .expect(message);
-}
-
-#[test]
-fn dynamic_api_transitions_update_weight_sentinel_and_entitlement() {
-    let scheduler = Scheduler::builder().weight(A, 2).build();
-    assert_eq!(2, scheduler.stats().classes[&A].weight);
-    assert_eq!(2_000, scheduler.soft_cpu_limit_millicores(A));
-    scheduler.set_soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap());
-    assert_eq!(0, scheduler.stats().classes[&A].weight);
-    assert_eq!(500, scheduler.soft_cpu_limit_millicores(A));
-    scheduler.set_weight(A, std::num::NonZeroU32::new(3).unwrap());
-    assert_eq!(3, scheduler.stats().classes[&A].weight);
-    assert_eq!(3_000, scheduler.soft_cpu_limit_millicores(A));
 }
 
 #[test]
@@ -1067,6 +1055,105 @@ async fn aborting_queued_tasks_reclaims_scheduler_state() {
     assert_eq!(0, stats.classes[&TaskClass::DEFAULT].queued);
 }
 
+#[test]
+fn absent_class_weight_one_update_is_a_true_no_op() {
+    let scheduler = Scheduler::builder().build();
+    assert!(!scheduler.stats().classes.contains_key(&A));
+    scheduler.set_weights(&BTreeMap::from([(
+        A,
+        std::num::NonZeroU32::new(1).unwrap(),
+    )]));
+    assert!(!scheduler.stats().classes.contains_key(&A));
+}
+
+#[test]
+fn concurrent_weight_updates_publish_complete_pairs_to_a_reader() {
+    let scheduler = Scheduler::builder().weight(A, 2).weight(B, 3).build();
+    let initial = BTreeMap::from([
+        (A, std::num::NonZeroU32::new(2).unwrap()),
+        (B, std::num::NonZeroU32::new(3).unwrap()),
+    ]);
+    let update = BTreeMap::from([
+        (A, std::num::NonZeroU32::new(7).unwrap()),
+        (B, std::num::NonZeroU32::new(11).unwrap()),
+    ]);
+    let start = Arc::new(Barrier::new(2));
+    let initial_observations = Arc::new(AtomicU64::new(0));
+    let update_observations = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader_scheduler = scheduler.clone();
+    let reader_start = start.clone();
+    let reader_initial_observations = initial_observations.clone();
+    let reader_update_observations = update_observations.clone();
+    let reader_done = done.clone();
+    let reader = std::thread::spawn(move || {
+        reader_start.wait();
+        while !reader_done.load(Ordering::Acquire) {
+            let stats = reader_scheduler.stats();
+            let pair = (stats.classes[&A].weight, stats.classes[&B].weight);
+            match pair {
+                (2, 3) => {
+                    reader_initial_observations.fetch_add(1, Ordering::Relaxed);
+                }
+                (7, 11) => {
+                    reader_update_observations.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => panic!("reader observed mixed weight pair: {pair:?}"),
+            }
+        }
+    });
+    start.wait();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for _ in 0..100 {
+        let update_before = update_observations.load(Ordering::Relaxed);
+        scheduler.set_weights(&update);
+        while update_observations.load(Ordering::Relaxed) == update_before
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let initial_before = initial_observations.load(Ordering::Relaxed);
+        scheduler.set_weights(&initial);
+        while initial_observations.load(Ordering::Relaxed) == initial_before
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    assert!(
+        initial_observations.load(Ordering::Relaxed) > 0,
+        "reader made no actual initial-pair observations"
+    );
+    assert!(
+        update_observations.load(Ordering::Relaxed) > 0,
+        "reader made no actual updated-pair observations"
+    );
+}
+
+#[test]
+fn set_weights_updates_only_the_listed_fractional_soft_limit_class() {
+    let scheduler = Scheduler::builder()
+        .soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap())
+        .soft_cpu_limit(B, SoftCpuLimit::from_millicores(1_500).unwrap())
+        .build();
+
+    scheduler.set_weights(&BTreeMap::from([(
+        A,
+        std::num::NonZeroU32::new(7).unwrap(),
+    )]));
+
+    let stats = scheduler.stats();
+    assert_eq!(7, stats.classes[&A].weight);
+    assert_eq!(7_000, scheduler.soft_cpu_limit_millicores(A));
+    assert_eq!(0, stats.classes[&B].weight);
+    assert_eq!(1_500, scheduler.soft_cpu_limit_millicores(B));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dynamic_config_ignores_idle_class_when_realigning_pass() {
     let scheduler = Scheduler::builder()
@@ -1106,9 +1193,12 @@ async fn dynamic_config_ignores_idle_class_when_realigning_pass() {
     let before = scheduler.stats();
     assert!(before.classes[&A].queued > 0);
     assert!(before.classes[&B].queued > 0);
-    // This is a no-op configuration update. An idle DEFAULT class must not
-    // make A look newly entitled and let it consume the next long run.
-    scheduler.set_weight(A, std::num::NonZeroU32::new(1).unwrap());
+    // Change A while B is backlogged, then verify B still rejoins bounded
+    // progress rather than being stranded by the pass realignment.
+    scheduler.set_weights(&BTreeMap::from([(
+        A,
+        std::num::NonZeroU32::new(2).unwrap(),
+    )]));
     // Capture admission baselines after the update so every observed delta is
     // necessarily from post-update admissions.
     let after_update = scheduler.stats();
@@ -1184,8 +1274,10 @@ async fn dynamic_weight_change_reallocates_share() {
     let b_exec_before_flip = stats_before_flip.classes[&B].total_exec_time.as_secs_f64();
 
     // Flip the weights dynamically: A 3:7 -> 7:3.
-    scheduler.set_weight(A, std::num::NonZeroU32::new(7).unwrap());
-    scheduler.set_weight(B, std::num::NonZeroU32::new(3).unwrap());
+    scheduler.set_weights(&BTreeMap::from([
+        (A, std::num::NonZeroU32::new(7).unwrap()),
+        (B, std::num::NonZeroU32::new(3).unwrap()),
+    ]));
 
     // After the flip, A should dominate the polls.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1228,66 +1320,6 @@ async fn dynamic_weight_change_reallocates_share() {
     assert_eq!(7, stats.classes[&A].weight);
     assert_eq!(3, stats.classes[&B].weight);
 
-    stop.store(true, Ordering::Release);
-    for handle in handles {
-        handle.await.unwrap();
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dynamic_soft_cpu_limit_change_reallocates_share_and_updates_query() {
-    let scheduler = Scheduler::builder()
-        .max_concurrent_polls(4)
-        .soft_cpu_limit(A, SoftCpuLimit::from_cores(3).unwrap())
-        .soft_cpu_limit(B, SoftCpuLimit::from_cores(7).unwrap())
-        .build();
-    let stop = Arc::new(AtomicBool::new(false));
-    let a = Arc::new(AtomicU64::new(0));
-    let b = Arc::new(AtomicU64::new(0));
-    let mut handles = Vec::new();
-    for _ in 0..32 {
-        for (class, polls) in [(A, a.clone()), (B, b.clone())] {
-            handles.push(scheduler.spawn_in(
-                class,
-                SaturatedWork {
-                    stop: stop.clone(),
-                    polls,
-                },
-            ));
-        }
-    }
-    wait_for_polls(
-        &[&a, &b],
-        20_000,
-        "initial dynamic soft-limit workload made no progress",
-    )
-    .await;
-    let before = scheduler.stats();
-    let a_before = before.classes[&A].total_exec_time.as_secs_f64();
-    let b_before = before.classes[&B].total_exec_time.as_secs_f64();
-    scheduler.set_soft_cpu_limit(A, SoftCpuLimit::from_cores(7).unwrap());
-    scheduler.set_soft_cpu_limit(B, SoftCpuLimit::from_cores(3).unwrap());
-    assert_eq!(0, scheduler.stats().classes[&A].weight);
-    assert_eq!(7_000, scheduler.soft_cpu_limit_millicores(A));
-    assert_eq!(3_000, scheduler.soft_cpu_limit_millicores(B));
-    let polls_before = a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if a.load(Ordering::Relaxed) + b.load(Ordering::Relaxed) >= polls_before + 20_000 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("updated soft-limit workload made no progress");
-    let after = scheduler.stats();
-    let a_exec = after.classes[&A].total_exec_time.as_secs_f64() - a_before;
-    let b_exec = after.classes[&B].total_exec_time.as_secs_f64() - b_before;
-    assert!(
-        a_exec / (a_exec + b_exec) >= 0.65,
-        "soft update did not reallocate exec time"
-    );
     stop.store(true, Ordering::Release);
     for handle in handles {
         handle.await.unwrap();

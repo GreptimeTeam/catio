@@ -386,30 +386,17 @@ impl Scheduler {
     /// Returns the class's normalized soft CPU entitlement in milli-cores.
     ///
     /// Legacy `weight(n)` configurations report `n * 1000`; classes configured
-    /// through [`SchedulerBuilder::soft_cpu_limit`] or
-    /// [`Self::set_soft_cpu_limit`] report their supplied milli-core limit.
-    /// Unregistered classes use the default legacy weight of one (1000m).
+    /// through [`SchedulerBuilder::soft_cpu_limit`] report their supplied
+    /// milli-core limit. Unregistered classes use the default legacy weight of
+    /// one (1000m).
     pub fn soft_cpu_limit_millicores(&self, class: TaskClass) -> u64 {
         self.inner.soft_cpu_limit_millicores(class)
     }
 
-    /// Dynamically changes the weight of a class. The class's pass is realigned
-    /// to the lowest pass among currently backlogged (queued) classes, falling
-    /// back to scheduler virtual time when none are backlogged, so historical
-    /// credit/debt from the old weight does not skew the new allocation.
-    /// Queued tasks are immediately re-dispatched under the new weights.
-    pub fn set_weight(&self, class: TaskClass, weight: NonZeroU32) {
-        self.inner.set_config(class, ClassConfig::legacy(weight));
-    }
-
-    /// Dynamically changes a class's soft CPU limit. Like [`Self::set_weight`],
-    /// this realigns the class pass to the lowest pass among currently
-    /// backlogged (queued) classes, falling back to scheduler virtual time
-    /// when none are backlogged, before immediately re-dispatching queued work.
-    /// The limit is a relative work-conserving entitlement, not a hard cap;
-    /// idle capacity remains borrowable.
-    pub fn set_soft_cpu_limit(&self, class: TaskClass, limit: SoftCpuLimit) {
-        self.inner.set_config(class, ClassConfig::soft(limit));
+    /// Atomically updates the listed legacy runtime weights; omitted classes
+    /// remain unchanged.
+    pub fn set_weights(&self, weights: &BTreeMap<TaskClass, NonZeroU32>) {
+        self.inner.set_weights(weights);
     }
 
     /// Dynamically changes the maximum number of concurrently admitted polls.
@@ -1144,27 +1131,44 @@ impl SchedulerInner {
             .map_or(1_000, |class_state| class_state.entitlement_millicores)
     }
 
-    fn set_config(&self, class: TaskClass, config: ClassConfig) {
+    fn set_weights(&self, weights: &BTreeMap<TaskClass, NonZeroU32>) {
         let wakers = {
             let mut state = lock(&self.state);
-            // Align this class's pass with the lowest pass among currently
-            // backlogged (queued) classes, falling back to scheduler virtual
-            // time when none are backlogged. Pass scheduling only cares about
-            // relative pass values; a class that accumulated a high pass under
-            // the old configuration would keep its low priority forever if we
-            // left it alone.
-            let min_pass = state
-                .classes
-                .values()
-                .filter(|c| c.queued > 0)
-                .map(|c| c.pass)
-                .min()
-                .unwrap_or(state.virtual_time);
-            let class_state = state.class_mut(class);
-            class_state.pass = min_pass;
-            class_state.entitlement_millicores = config.entitlement_millicores;
-            class_state.stats.weight = config.legacy_weight;
-            state.dispatch()
+            let changed = weights
+                .iter()
+                .filter_map(|(class, weight)| {
+                    let Some(class_state) = state.classes.get(class) else {
+                        // The default configuration is weight one. Do not
+                        // materialize an otherwise absent class for that
+                        // implicit configuration.
+                        return (weight.get() != 1).then_some((*class, *weight));
+                    };
+                    let unchanged = class_state.stats.weight == weight.get()
+                        && class_state.entitlement_millicores == u64::from(weight.get()) * 1_000;
+                    (!unchanged).then_some((*class, *weight))
+                })
+                .collect::<Vec<_>>();
+            if changed.is_empty() {
+                WakeBatch::default()
+            } else {
+                // Align changed classes to the same pass before changing any
+                // configuration. Prefer queued classes, falling back to the
+                // scheduler clock when none are queued.
+                let baseline = state
+                    .classes
+                    .values()
+                    .filter(|class| class.queued > 0)
+                    .map(|class| class.pass)
+                    .min()
+                    .unwrap_or(state.virtual_time);
+                for (class, weight) in changed {
+                    let class_state = state.class_mut(class);
+                    class_state.pass = baseline;
+                    class_state.entitlement_millicores = u64::from(weight.get()) * 1_000;
+                    class_state.stats.weight = weight.get();
+                }
+                state.dispatch()
+            }
         };
         wake_all(wakers);
     }
