@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use catio::{Scheduler, SoftCpuLimit, TaskClass};
 
@@ -1077,23 +1077,81 @@ fn concurrent_weight_updates_publish_complete_pairs_to_a_reader() {
         (A, std::num::NonZeroU32::new(7).unwrap()),
         (B, std::num::NonZeroU32::new(11).unwrap()),
     ]);
+    let start = Arc::new(Barrier::new(2));
+    let initial_observations = Arc::new(AtomicU64::new(0));
+    let update_observations = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let reader_scheduler = scheduler.clone();
+    let reader_start = start.clone();
+    let reader_initial_observations = initial_observations.clone();
+    let reader_update_observations = update_observations.clone();
     let reader_done = done.clone();
     let reader = std::thread::spawn(move || {
+        reader_start.wait();
         while !reader_done.load(Ordering::Acquire) {
             let stats = reader_scheduler.stats();
             let pair = (stats.classes[&A].weight, stats.classes[&B].weight);
-            assert!(matches!(pair, (2, 3) | (7, 11)));
-            std::thread::yield_now();
+            match pair {
+                (2, 3) => {
+                    reader_initial_observations.fetch_add(1, Ordering::Relaxed);
+                }
+                (7, 11) => {
+                    reader_update_observations.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => panic!("reader observed mixed weight pair: {pair:?}"),
+            }
         }
     });
-    for _ in 0..2_000 {
+    start.wait();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for _ in 0..100 {
+        let update_before = update_observations.load(Ordering::Relaxed);
         scheduler.set_weights(&update);
+        while update_observations.load(Ordering::Relaxed) == update_before
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let initial_before = initial_observations.load(Ordering::Relaxed);
         scheduler.set_weights(&initial);
+        while initial_observations.load(Ordering::Relaxed) == initial_before
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
     }
     done.store(true, Ordering::Release);
     reader.join().unwrap();
+    assert!(
+        initial_observations.load(Ordering::Relaxed) > 0,
+        "reader made no actual initial-pair observations"
+    );
+    assert!(
+        update_observations.load(Ordering::Relaxed) > 0,
+        "reader made no actual updated-pair observations"
+    );
+}
+
+#[test]
+fn set_weights_updates_only_the_listed_fractional_soft_limit_class() {
+    let scheduler = Scheduler::builder()
+        .soft_cpu_limit(A, SoftCpuLimit::from_millicores(500).unwrap())
+        .soft_cpu_limit(B, SoftCpuLimit::from_millicores(1_500).unwrap())
+        .build();
+
+    scheduler.set_weights(&BTreeMap::from([(
+        A,
+        std::num::NonZeroU32::new(7).unwrap(),
+    )]));
+
+    let stats = scheduler.stats();
+    assert_eq!(7, stats.classes[&A].weight);
+    assert_eq!(7_000, scheduler.soft_cpu_limit_millicores(A));
+    assert_eq!(0, stats.classes[&B].weight);
+    assert_eq!(1_500, scheduler.soft_cpu_limit_millicores(B));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
